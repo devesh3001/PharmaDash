@@ -381,7 +381,7 @@ export async function processPayment(req: Request, res: Response): Promise<void>
 
 export async function submitOrderFeedback(req: Request, res: Response): Promise<void> {
   if (!req.user) throw new AuthError("Unauthenticated");
-  const { id } = req.params;
+  const id = req.params.id as string;
   const { rating, feedback } = req.body as { rating: number; feedback?: string };
 
   if (typeof rating !== "number" || rating < 1 || rating > 5) {
@@ -390,7 +390,7 @@ export async function submitOrderFeedback(req: Request, res: Response): Promise<
   }
 
   const order = await prisma.order.findUnique({ where: { id } });
-  if (!order) throw new OrderNotFoundError(`Order ${id} not found`);
+  if (!order) throw new OrderNotFoundError();
 
   if (order.customerId !== req.user.id && req.user.role !== "ADMIN") {
     throw new AuthError("Unauthorized to rate this order");
@@ -402,7 +402,7 @@ export async function submitOrderFeedback(req: Request, res: Response): Promise<
   }
 
   const updated = await prisma.order.update({
-    where: { id },
+    where: { id: id as string },
     data: { rating, feedback },
   });
 
