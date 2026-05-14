@@ -17,9 +17,6 @@
   "engines": {
     "node": ">=20"
   },
-  "prisma": {
-    "seed": "tsx prisma/seed.ts"
-  },
   "dependencies": {
     "@prisma/client": "6.19.0",
     "@types/bcryptjs": "^2.4.6",

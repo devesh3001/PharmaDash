@@ -10,11 +10,11 @@ RUN cd customer-app && npm run build
 FROM node:20-slim AS backend-builder
 RUN apt-get update && apt-get install -y openssl
 WORKDIR /app
+ENV PRISMA_SKIP_POSTINSTALL_GENERATE=1
 COPY backend/package*.json ./backend/
 RUN cd backend && npm install
 COPY backend/ ./backend/
-RUN cd backend && npx prisma generate
-RUN cd backend && npm run build
+RUN cd backend && npx prisma generate && npm run build
 
 # Stage 3: Production Image
 FROM node:20-slim
