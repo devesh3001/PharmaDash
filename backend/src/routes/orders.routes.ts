@@ -6,6 +6,7 @@ import {
   listOrders,
   getOrder,
   updateOrderStatus,
+  processPayment,
 } from "../controllers/orders.controller";
 
 export const ordersRouter = Router();
@@ -17,3 +18,4 @@ ordersRouter.post("/", requireRole("CUSTOMER"), asyncHandler(createOrder));
 ordersRouter.get("/", asyncHandler(listOrders));
 ordersRouter.get("/:id", asyncHandler(getOrder));
 ordersRouter.patch("/:id/status", requireRole("RIDER", "ADMIN"), asyncHandler(updateOrderStatus));
+ordersRouter.post("/:id/payment", requireRole("CUSTOMER"), asyncHandler(processPayment));

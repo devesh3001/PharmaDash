@@ -117,14 +117,21 @@ function formatOrder(order: {
 export async function createOrder(req: Request, res: Response): Promise<void> {
   if (!req.user) throw new AuthError("Unauthenticated");
 
-  const { items } = req.body as { items?: OrderItemInput[] };
-  const customerId = req.user.id;
+  const { items, promoCode, delivery_address, delivery_lat, delivery_lng, is_emergency } = req.body as {
+    items: Array<{ medicineId: string; quantity: number }>;
+    promoCode?: string;
+    delivery_address?: string;
+    delivery_lat?: number;
+    delivery_lng?: number;
+    is_emergency?: boolean;
+  };
 
   if (!Array.isArray(items) || items.length === 0) {
     throw new CheckoutValidationError("items must be a non-empty array");
   }
   const merged = mergeQuantities(items);
   const medicineIds = [...merged.keys()];
+  const customerId = req.user.id;
 
   const order = await prisma.$transaction(
     async (tx) => {
@@ -167,7 +174,11 @@ export async function createOrder(req: Request, res: Response): Promise<void> {
           customerId,
           pharmacyId,
           total_amount: total,
-          status: "PENDING",
+          status: "PAYMENT_PENDING",
+          is_emergency: !!is_emergency,
+          delivery_address,
+          delivery_lat,
+          delivery_lng,
           orderItems: {
             create: [...merged.entries()].map(([medicineId, quantity]) => ({
               medicineId,
@@ -200,10 +211,16 @@ export async function listOrders(req: Request, res: Response): Promise<void> {
     | "PENDING" | "ACCEPTED" | "OUT_FOR_DELIVERY" | "DELIVERED" | "CANCELLED"
     | undefined;
 
-  // Admins and riders see all orders; customers see only theirs
-  const isAdmin = req.user.role === "ADMIN";
+  // Admins see all; riders see PENDING or their own; customers see their own
+  const canSeeAll = req.user.role === "ADMIN";
+  const isRider = req.user.role === "RIDER";
   const where = {
-    ...(isAdmin ? {} : { customerId: req.user.id }),
+    ...(canSeeAll ? {} : isRider ? {
+      OR: [
+        { status: "PENDING" as any },
+        { riderId: req.user.id }
+      ]
+    } : { customerId: req.user.id }),
     ...(statusFilter ? { status: statusFilter } : {}),
   };
 
@@ -212,7 +229,10 @@ export async function listOrders(req: Request, res: Response): Promise<void> {
       where,
       skip,
       take: limit,
-      orderBy: { createdAt: "desc" },
+      orderBy: [
+        { is_emergency: "desc" },
+        { createdAt: "desc" }
+      ],
       include: { orderItems: { select: ORDER_ITEM_SELECT } },
     }),
     prisma.order.count({ where }),
@@ -234,6 +254,7 @@ export async function getOrder(req: Request, res: Response): Promise<void> {
     include: {
       orderItems: { select: ORDER_ITEM_SELECT },
       pharmacy: { select: { id: true, name: true, latitude: true, longitude: true } },
+      rider: { select: { id: true, full_name: true, phone_number: true } },
     },
   });
 
@@ -256,6 +277,7 @@ export async function updateOrderStatus(req: Request, res: Response): Promise<vo
   const { status } = req.body as { status?: string };
 
   const validTransitions: Record<string, string[]> = {
+    PAYMENT_PENDING: ["PENDING", "CANCELLED"],
     PENDING: ["ACCEPTED", "CANCELLED"],
     ACCEPTED: ["OUT_FOR_DELIVERY", "CANCELLED"],
     OUT_FOR_DELIVERY: ["DELIVERED"],
@@ -268,7 +290,7 @@ export async function updateOrderStatus(req: Request, res: Response): Promise<vo
 
   if (!status || !(status in validTransitions)) {
     res.status(400).json({
-      error: "Invalid status. Must be one of: PENDING, ACCEPTED, OUT_FOR_DELIVERY, DELIVERED, CANCELLED",
+      error: "Invalid status. Must be one of: PAYMENT_PENDING, PENDING, ACCEPTED, OUT_FOR_DELIVERY, DELIVERED, CANCELLED",
     });
     return;
   }
@@ -281,10 +303,77 @@ export async function updateOrderStatus(req: Request, res: Response): Promise<vo
     return;
   }
 
+  let extraData: any = {};
+  if (status === "ACCEPTED" && req.user.role === "RIDER") {
+    if (order.riderId && order.riderId !== req.user.id) {
+      res.status(403).json({ error: "Order is already claimed by another rider." });
+      return;
+    }
+    extraData.riderId = req.user.id;
+  }
+
+  if (req.user.role === "RIDER" && ["OUT_FOR_DELIVERY", "DELIVERED"].includes(status)) {
+    if (order.riderId !== req.user.id) {
+       res.status(403).json({ error: "You cannot update an order assigned to someone else." });
+       return;
+    }
+  }
+
   const updated = await prisma.order.update({
     where: { id },
-    data: { status: status as "PENDING" | "ACCEPTED" | "OUT_FOR_DELIVERY" | "DELIVERED" | "CANCELLED" },
+    data: { status: status as "PAYMENT_PENDING" | "PENDING" | "ACCEPTED" | "OUT_FOR_DELIVERY" | "DELIVERED" | "CANCELLED", ...extraData },
     include: { orderItems: { select: ORDER_ITEM_SELECT } },
+  });
+
+  res.json({ order: formatOrder(updated) });
+}
+
+// POST /api/orders/:id/payment   body: { method: "COD" | "MOCK_UPI" | "MOCK_CARD" }
+export async function processPayment(req: Request, res: Response): Promise<void> {
+  if (!req.user) throw new AuthError("Unauthenticated");
+
+  const id = String(req.params.id);
+  const { method } = req.body as { method?: string };
+
+  if (!method || !["COD", "MOCK_UPI", "MOCK_CARD"].includes(method)) {
+    res.status(400).json({ error: "Invalid payment method" });
+    return;
+  }
+
+  const order = await prisma.order.findUnique({ where: { id } });
+  if (!order) throw new OrderNotFoundError();
+
+  if (order.customerId !== req.user.id) {
+    res.status(403).json({ error: "Forbidden" });
+    return;
+  }
+
+  if (order.status !== "PAYMENT_PENDING") {
+    res.status(400).json({ error: "Order is not pending payment" });
+    return;
+  }
+
+  // Simulate payment delay
+  if (method !== "COD") {
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+
+  const updated = await prisma.$transaction(async (tx) => {
+    await tx.payment.create({
+      data: {
+        orderId: order.id,
+        amount: order.total_amount,
+        method,
+        status: "SUCCESS",
+        transactionId: method === "COD" ? null : `TXN_${Date.now()}_${Math.random().toString(36).substring(7)}`,
+      },
+    });
+
+    return tx.order.update({
+      where: { id: order.id },
+      data: { status: "PENDING" },
+      include: { orderItems: { select: ORDER_ITEM_SELECT } },
+    });
   });
 
   res.json({ order: formatOrder(updated) });
