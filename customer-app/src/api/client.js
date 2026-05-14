@@ -51,4 +51,5 @@ export const api = {
   getUsers:     (params = {}) => req(`/api/users?${new URLSearchParams(params)}`),
   getAdminStats:() => req('/api/admin/analytics'),
   scanPrescription: (formData) => req('/api/medicines/scan', { method: 'POST', body: formData, headers: { 'Content-Type': undefined } }),
+  submitFeedback: (id, payload) => req(`/api/orders/${id}/feedback`, { method: 'PATCH', body: JSON.stringify(payload) }),
 };

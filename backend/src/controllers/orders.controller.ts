@@ -378,3 +378,33 @@ export async function processPayment(req: Request, res: Response): Promise<void>
 
   res.json({ order: formatOrder(updated) });
 }
+
+export async function submitOrderFeedback(req: Request, res: Response): Promise<void> {
+  if (!req.user) throw new AuthError("Unauthenticated");
+  const { id } = req.params;
+  const { rating, feedback } = req.body as { rating: number; feedback?: string };
+
+  if (typeof rating !== "number" || rating < 1 || rating > 5) {
+    res.status(400).json({ error: "Rating must be between 1 and 5" });
+    return;
+  }
+
+  const order = await prisma.order.findUnique({ where: { id } });
+  if (!order) throw new OrderNotFoundError(`Order ${id} not found`);
+
+  if (order.customerId !== req.user.id && req.user.role !== "ADMIN") {
+    throw new AuthError("Unauthorized to rate this order");
+  }
+
+  if (order.status !== "DELIVERED") {
+    res.status(400).json({ error: "Can only rate delivered orders" });
+    return;
+  }
+
+  const updated = await prisma.order.update({
+    where: { id },
+    data: { rating, feedback },
+  });
+
+  res.json({ success: true, order: formatOrder(updated) });
+}

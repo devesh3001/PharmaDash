@@ -5,9 +5,78 @@ import { Navbar } from '../components/Navbar';
 import { CartDrawer } from '../components/CartDrawer';
 import { StatusBadge } from '../components/StatusBadge';
 import { TrackingScreen } from '../App.jsx';
+import { useToast } from '../context/ToastContext';
 
 const STEPS = ['PENDING', 'ACCEPTED', 'OUT_FOR_DELIVERY', 'DELIVERED'];
 const STEP_LABELS = { PENDING: 'Order Placed', ACCEPTED: 'Accepted', OUT_FOR_DELIVERY: 'On the Way', DELIVERED: 'Delivered' };
+
+function FeedbackCard({ orderId, existingRating, existingFeedback, onSubmitted }) {
+  const [rating, setRating] = useState(existingRating || 0);
+  const [hover, setHover]   = useState(0);
+  const [text, setText]     = useState(existingFeedback || '');
+  const [busy, setBusy]     = useState(false);
+  const toast = useToast();
+
+  if (existingRating && !busy) {
+    return (
+      <div className="od-section feedback-card-submitted">
+        <h2 className="od-section-title">Your Feedback</h2>
+        <div className="feedback-content">
+          <div className="stars-static">
+            {[1,2,3,4,5].map(s => <span key={s} className="star-static">{s <= existingRating ? '⭐' : '☆'}</span>)}
+          </div>
+          {existingFeedback && <p className="feedback-text">"{existingFeedback}"</p>}
+        </div>
+      </div>
+    );
+  }
+
+  async function submit() {
+    if (rating === 0) {
+      toast.error('Please select a rating');
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.submitFeedback(orderId, { rating, feedback: text });
+      toast.success('Feedback submitted! Thank you.');
+      onSubmitted();
+    } catch (e) { toast.error(e.message); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div className="od-section feedback-card">
+      <h2 className="od-section-title">Rate your Experience</h2>
+      <div className="feedback-form">
+        <p style={{ color: 'var(--text2)', marginBottom: '12px', fontSize: '14px' }}>How was your delivery experience?</p>
+        <div className="stars-input">
+          {[1,2,3,4,5].map(s => (
+            <button
+              key={s}
+              className={`star-btn ${(hover || rating) >= s ? 'active' : ''}`}
+              onClick={() => setRating(s)}
+              onMouseEnter={() => setHover(s)}
+              onMouseLeave={() => setHover(0)}
+            >
+              ⭐
+            </button>
+          ))}
+        </div>
+        <textarea
+          className="input-field"
+          placeholder="Optional: Tell us what went well or what we can improve..."
+          value={text}
+          onChange={e => setText(e.target.value)}
+          style={{ marginTop: '16px', minHeight: '80px', fontSize: '14px' }}
+        />
+        <button className="btn-primary" onClick={submit} disabled={busy || rating === 0} style={{ marginTop: '16px', width: '100%' }}>
+          {busy ? <span className="spinner-sm" /> : 'Submit Feedback'}
+        </button>
+      </div>
+    </div>
+  );
+}
 
 export function OrderDetailPage() {
   const { id } = useParams();
@@ -73,6 +142,17 @@ export function OrderDetailPage() {
               <div className="cancelled-banner">
                 ❌ This order was cancelled
               </div>
+            )}
+
+            {order.status === 'DELIVERED' && (
+              <FeedbackCard 
+                orderId={order.id} 
+                existingRating={order.rating} 
+                existingFeedback={order.feedback}
+                onSubmitted={() => {
+                  api.getOrder(order.id).then(({ data }) => setOrder(data));
+                }} 
+              />
             )}
 
             {!isCancelled && ['ACCEPTED', 'OUT_FOR_DELIVERY'].includes(order.status) && (

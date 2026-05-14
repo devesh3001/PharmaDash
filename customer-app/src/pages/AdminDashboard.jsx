@@ -162,8 +162,8 @@ export function AdminDashboard() {
             <div className="stats-row" style={{ marginBottom: '32px' }}>
               <StatCard icon="📈" label="Total Revenue"  value={`₹${statsData.revenue}`} color="green" />
               <StatCard icon="⏳" label="Active Orders"  value={statsData.activeOrdersCount} color="amber" />
-              <StatCard icon="👥" label="Total Users"    value={statsData.demographics?.CUSTOMER || 0} color="cyan" />
-              <StatCard icon="🛵" label="Riders"         value={statsData.demographics?.RIDER || 0} color="purple" />
+              <StatCard icon="⭐" label="Platform Rating" value={`${statsData.avgRating?.toFixed(1) || '0.0'}/5.0`} color="cyan" />
+              <StatCard icon="🛵" label="Riders Online"  value={statsData.demographics?.RIDER || 0} color="purple" />
             </div>
 
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px' }}>

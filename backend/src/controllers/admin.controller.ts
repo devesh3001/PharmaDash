@@ -41,6 +41,13 @@ export async function getDashboardStats(req: Request, res: Response): Promise<vo
     orderBy: { stock_quantity: 'asc' }
   });
 
+  // 6. Average Rating
+  const ratingAggregate = await prisma.order.aggregate({
+    _avg: { rating: true },
+    where: { rating: { not: null } }
+  });
+  const avgRating = ratingAggregate._avg.rating || 0;
+
   // 5. Recent Activity Feed (Last 10 Orders)
   const recentOrders = await prisma.order.findMany({
     take: 10,
@@ -55,6 +62,7 @@ export async function getDashboardStats(req: Request, res: Response): Promise<vo
     revenue: totalRevenue,
     activeOrdersCount,
     demographics,
+    avgRating,
     lowStockItems: lowStockItems.map(i => ({
       id: i.id,
       medicine: i.medicine.name,
