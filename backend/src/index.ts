@@ -41,8 +41,17 @@ app.use(express.json());
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
 app.get("/health", async (_req, res) => {
-  await prisma.$queryRaw`SELECT 1`;
-  res.json({ ok: true, timestamp: new Date().toISOString() });
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    res.json({ ok: true, timestamp: new Date().toISOString() });
+  } catch (err) {
+    console.error("[health] database check failed:", err);
+    res.status(503).json({
+      ok: false,
+      error: "Database unavailable",
+      timestamp: new Date().toISOString(),
+    });
+  }
 });
 
 app.use("/api/auth", authRouter);
@@ -91,8 +100,8 @@ if (process.env.NODE_ENV === "production") {
   const frontendPath = path.join(__dirname, "../../customer-app/dist");
   app.use(express.static(frontendPath));
 
-  app.get("*", (req, res, next) => {
-    // Skip API routes
+  // Express 5 rejects bare "*" routes; use middleware after static instead.
+  app.use((req, res, next) => {
     if (req.path.startsWith("/api") || req.path.startsWith("/health")) return next();
     res.sendFile(path.join(frontendPath, "index.html"));
   });
