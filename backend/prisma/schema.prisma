@@ -1,23 +1,23 @@
-// PharmaDash — PostgreSQL schema tuned for concurrent order/checkout flows.
-// https://www.prisma.io/docs/orm/prisma-schema/overview
-
 generator client {
-  provider      = "prisma-client-js"
-  binaryTargets = ["native", "debian-openssl-3.0.x"]
+  provider = "prisma-client-js"
 }
 
 datasource db {
-  provider  = "postgresql"
-  url       = env("DATABASE_URL")
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
   directUrl = env("DIRECT_URL")
 }
+
 enum UserRole {
-  CUSTOMER
-  RIDER
   ADMIN
+  PHARMACY_ADMIN
+  PHARMACIST
+  RIDER
+  CUSTOMER
 }
 
 enum OrderStatus {
+  PRESCRIPTION_PENDING
   PAYMENT_PENDING
   PENDING
   ACCEPTED
@@ -34,10 +34,16 @@ model User {
   password_hash String
   createdAt     DateTime @default(now())
 
+  pharmacyId String?
+  pharmacy   Pharmacy? @relation("PharmacyStaff", fields: [pharmacyId], references: [id])
+  inventoryTransactions InventoryTransaction[]
+  customerPrescriptions Prescription[] @relation("PrescriptionCustomer")
+  pharmacistPrescriptions Prescription[] @relation("PrescriptionPharmacist")
   orders     Order[] @relation("OrderCustomer")
   deliveries Order[] @relation("OrderRider")
 
   @@index([role])
+  @@index([pharmacyId])
 }
 
 model Pharmacy {
@@ -48,6 +54,7 @@ model Pharmacy {
 
   inventory Inventory[]
   orders    Order[]
+  staff     User[] @relation("PharmacyStaff")
 
   @@index([name])
 }
@@ -57,42 +64,46 @@ model Medicine {
   name                  String
   generic_name          String
   price                 Decimal @db.Decimal(12, 2)
+  manufacturer          String
   requires_prescription Boolean @default(false)
+  stock_quantity        Int     @default(0) // Legacy global stock
 
   inventory  Inventory[]
   orderItems OrderItem[]
-
-  @@index([name])
-  @@index([generic_name])
 }
 
-/// Inventory rows are the hot path for race conditions during checkout.
-///
-/// **Transaction locking strategy (no negative stock under concurrency):**
-/// - Run stock decrements inside a single database transaction with isolation
-///   `Serializable` or `Repeatable Read`, or explicitly lock the touched rows first.
-/// - For each `(pharmacyId, medicineId)` line item, `SELECT` the inventory row
-///   with `FOR UPDATE` (row-level lock) *before* reading `stock_quantity` and
-///   computing the new value — e.g. via `prisma.$transaction` + `$queryRaw`
-///   `SELECT * FROM "Inventory" WHERE ... FOR UPDATE`, then `UPDATE` only if
-///   `stock_quantity >= qty`. The lock serializes competing checkouts on the same SKU.
-/// - Alternatively use a **single-statement conditional update** (atomic check-and-set):
-///   `UPDATE ... SET stock_quantity = stock_quantity - $qty WHERE id = $id AND stock_quantity >= $qty`
-///   and verify `rowsAffected === 1`; retry or abort the outer transaction on failure.
-/// - Prisma interactive transactions (`prisma.$transaction(async (tx) => { ... })`)
-///   pair naturally with raw `FOR UPDATE` for pessimistic control on high-contention SKUs.
 model Inventory {
-  id             String @id @default(cuid())
-  pharmacyId     String
-  medicineId     String
-  stock_quantity Int
+  id         String   @id @default(cuid())
+  pharmacyId String
+  medicineId String
 
   pharmacy Pharmacy @relation(fields: [pharmacyId], references: [id], onDelete: Cascade)
   medicine Medicine @relation(fields: [medicineId], references: [id], onDelete: Cascade)
 
+  batches Batch[]
+
   @@unique([pharmacyId, medicineId])
   @@index([pharmacyId])
   @@index([medicineId])
+}
+
+model Batch {
+  id          String   @id @default(cuid())
+  inventoryId String
+  batchNumber String
+  expiryDate  DateTime
+  isLegacy    Boolean  @default(false)
+  quantity    Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  inventory Inventory @relation(fields: [inventoryId], references: [id], onDelete: Cascade)
+  allocations OrderItemBatchAllocation[]
+  transactions InventoryTransaction[]
+
+  @@unique([inventoryId, batchNumber])
+  @@index([inventoryId])
+  @@index([expiryDate])
 }
 
 model Order {
@@ -101,26 +112,29 @@ model Order {
   pharmacyId       String
   riderId          String?
   status           OrderStatus @default(PENDING)
-  is_emergency     Boolean     @default(false)
   total_amount     Decimal     @db.Decimal(12, 2)
-  rating           Int?
-  feedback         String?
   delivery_address String?
   delivery_lat     Float?
   delivery_lng     Float?
   createdAt        DateTime    @default(now())
+  rating                Int?
+  feedback              String?
+  deliveryOtpHash       String?
+  deliveryOtpExpiresAt  DateTime?
+  deliveryOtpAttempts   Int       @default(0)
+  deliveryOtpVerifiedAt DateTime?
+  deliveryOtpIssuedAt   DateTime?
 
-  customer   User        @relation("OrderCustomer", fields: [customerId], references: [id], onDelete: Restrict)
-  pharmacy   Pharmacy    @relation(fields: [pharmacyId], references: [id], onDelete: Restrict)
-  rider      User?       @relation("OrderRider", fields: [riderId], references: [id], onDelete: Restrict)
-  orderItems OrderItem[]
-  payment    Payment?
+  customer      User           @relation("OrderCustomer", fields: [customerId], references: [id], onDelete: Restrict)
+  pharmacy      Pharmacy       @relation(fields: [pharmacyId], references: [id], onDelete: Restrict)
+  rider         User?          @relation("OrderRider", fields: [riderId], references: [id], onDelete: Restrict)
+  orderItems    OrderItem[]
+  payment       Payment?
+  prescriptions Prescription[]
 
   @@index([customerId])
   @@index([pharmacyId])
   @@index([riderId])
-  @@index([status])
-  @@index([customerId, status])
 }
 
 model OrderItem {
@@ -132,19 +146,117 @@ model OrderItem {
 
   order    Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
   medicine Medicine @relation(fields: [medicineId], references: [id], onDelete: Restrict)
+  allocations OrderItemBatchAllocation[]
 
   @@index([orderId])
   @@index([medicineId])
 }
 
-model Payment {
-  id            String   @id @default(cuid())
-  orderId       String   @unique
-  amount        Decimal  @db.Decimal(12, 2)
-  method        String   // "COD" | "MOCK_UPI" | "MOCK_CARD"
-  status        String   @default("PENDING") // "PENDING" | "SUCCESS" | "FAILED"
-  transactionId String?
-  createdAt     DateTime @default(now())
+model OrderItemBatchAllocation {
+  id          String @id @default(cuid())
+  orderItemId String
+  batchId     String
+  quantity    Int
 
-  order         Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  batch     Batch     @relation(fields: [batchId], references: [id], onDelete: Cascade)
+
+  @@unique([orderItemId, batchId])
+  @@index([orderItemId])
+  @@index([batchId])
+}
+
+enum InventoryTransactionType {
+  PURCHASE
+  ORDER
+  RETURN
+  CANCELLATION
+  ADJUSTMENT
+  DAMAGED
+  EXPIRED
+}
+
+model InventoryTransaction {
+  id              String                   @id @default(cuid())
+  batchId         String
+  quantityDelta   Int
+  transactionType InventoryTransactionType
+  referenceId     String?
+  performedById   String
+
+  batch       Batch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  performedBy User  @relation(fields: [performedById], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+
+  @@index([batchId])
+  @@index([performedById])
+  @@index([referenceId])
+}
+
+model Payment {
+  id              String   @id @default(cuid())
+  orderId         String   @unique
+  amount          Decimal  @db.Decimal(12, 2)
+  method          String?
+  status          String   @default("PENDING")
+  transactionId   String?
+  provider        String?
+  providerOrderId String?  @unique
+  refundId        String?  @unique
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@index([providerOrderId])
+}
+
+model Session {
+  id        String   @id
+  sid       String   @unique
+  data      String
+  expiresAt DateTime
+}
+
+model PromoCode {
+  id              String   @id @default(cuid())
+  code            String   @unique
+  discountPercent Int
+  active          Boolean  @default(true)
+  expiresAt       DateTime?
+  createdAt       DateTime @default(now())
+}
+
+enum PrescriptionStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model Prescription {
+  id               String             @id @default(cuid())
+  orderId          String
+  customerId       String
+  storageKey       String
+  originalFilename String
+  mimeType         String
+  fileSize         Int
+  status           PrescriptionStatus @default(PENDING)
+  pharmacistId     String?
+  notes            String?
+  ocrText          String?
+  aiSuggestions    Json?
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+
+  order            Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  customer         User   @relation("PrescriptionCustomer", fields: [customerId], references: [id], onDelete: Cascade)
+  pharmacist       User?  @relation("PrescriptionPharmacist", fields: [pharmacistId], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+  @@index([customerId])
+  @@index([pharmacistId])
+  @@index([status])
 }

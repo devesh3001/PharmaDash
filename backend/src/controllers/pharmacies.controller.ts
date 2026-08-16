@@ -92,6 +92,7 @@ export async function getPharmacyInventory(req: Request, res: Response): Promise
             requires_prescription: true,
           },
         },
+        batches: { select: { quantity: true } }
       },
       orderBy: { medicine: { name: "asc" } },
     }),
@@ -99,17 +100,20 @@ export async function getPharmacyInventory(req: Request, res: Response): Promise
   ]);
 
   res.json({
-    data: items.map((row) => ({
-      inventoryId: row.id,
-      stock_quantity: row.stock_quantity,
-      medicine: {
-        id: row.medicine.id,
-        name: row.medicine.name,
-        generic_name: row.medicine.generic_name,
-        price: row.medicine.price.toString(),
-        requires_prescription: row.medicine.requires_prescription,
-      },
-    })),
+    data: items.map((row) => {
+      const stock = row.batches.reduce((sum, b) => sum + b.quantity, 0);
+      return {
+        inventoryId: row.id,
+        stock_quantity: stock,
+        medicine: {
+          id: row.medicine.id,
+          name: row.medicine.name,
+          generic_name: row.medicine.generic_name,
+          price: row.medicine.price.toString(),
+          requires_prescription: row.medicine.requires_prescription,
+        },
+      };
+    }),
     meta: { total, page, limit, pages: Math.ceil(total / limit) },
   });
 }

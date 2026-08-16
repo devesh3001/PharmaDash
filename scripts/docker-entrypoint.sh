@@ -2,7 +2,7 @@
 set -e
 
 echo "Applying database schema..."
-npx prisma db push --skip-generate
+npx prisma migrate deploy
 
 echo "Starting PharmaDash API..."
 exec node dist/index.js

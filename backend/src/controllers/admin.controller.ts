@@ -31,15 +31,22 @@ export async function getDashboardStats(req: Request, res: Response): Promise<vo
   };
 
   // 4. Low Stock Alerts (Stock <= 20)
-  const lowStockItems = await prisma.inventory.findMany({
-    where: { stock_quantity: { lte: 20 } },
+  const allInventories = await prisma.inventory.findMany({
     include: {
       medicine: { select: { name: true } },
-      pharmacy: { select: { name: true } }
+      pharmacy: { select: { name: true } },
+      batches: { select: { quantity: true } }
     },
-    take: 10,
-    orderBy: { stock_quantity: 'asc' }
   });
+
+  const lowStockItems = allInventories
+    .map(i => {
+      const stock = i.batches.reduce((sum, b) => sum + b.quantity, 0);
+      return { ...i, stock };
+    })
+    .filter(i => i.stock <= 20)
+    .sort((a, b) => a.stock - b.stock)
+    .slice(0, 10);
 
   // 6. Average Rating
   const ratingAggregate = await prisma.order.aggregate({
@@ -67,7 +74,7 @@ export async function getDashboardStats(req: Request, res: Response): Promise<vo
       id: i.id,
       medicine: i.medicine.name,
       pharmacy: i.pharmacy.name,
-      stock: i.stock_quantity
+      stock: i.stock
     })),
     recentOrders: recentOrders.map(o => ({
       id: o.id,

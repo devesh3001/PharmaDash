@@ -17,6 +17,7 @@ declare global {
       user?: {
         id: string;
         role: string;
+        pharmacyId?: string;
       };
     }
   }
@@ -30,7 +31,7 @@ export function authenticate(req: Request, _res: Response, next: NextFunction): 
   const token = header.slice(7);
   try {
     const payload = verifyToken(token);
-    req.user = { id: payload.sub, role: payload.role };
+    req.user = { id: payload.sub, role: payload.role, pharmacyId: payload.pharmacyId };
     next();
   } catch {
     next(new AuthError("Invalid or expired token"));

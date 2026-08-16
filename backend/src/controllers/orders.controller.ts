@@ -2,6 +2,7 @@ import type { Request, Response } from "express";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../db/prisma";
 import { AuthError } from "../middleware/auth.middleware";
+import crypto from "node:crypto";
 
 function qs(val: unknown): string | undefined {
   return typeof val === "string" ? val : undefined;
@@ -84,6 +85,10 @@ function formatOrder(order: {
   status: string;
   total_amount: Prisma.Decimal;
   createdAt: Date;
+  // 👉 1. Add the new fields to the Type Definition
+  delivery_address?: string | null;
+  delivery_lat?: number | null;
+  delivery_lng?: number | null;
   orderItems?: {
     id: string;
     quantity: number;
@@ -98,9 +103,15 @@ function formatOrder(order: {
     status: order.status,
     total_amount: order.total_amount.toString(),
     createdAt: order.createdAt,
+    
+    // 👉 2. Send the new fields to the Frontend
+    delivery_address: order.delivery_address,
+    delivery_lat: order.delivery_lat,
+    delivery_lng: order.delivery_lng,
+
     ...(order.orderItems
       ? {
-          items: order.orderItems.map((item) => ({
+          orderItems: order.orderItems.map((item) => ({
             id: item.id,
             quantity: item.quantity,
             unit_price: item.unit_price.toString(),
@@ -110,7 +121,6 @@ function formatOrder(order: {
       : {}),
   };
 }
-
 // ─── Controllers ─────────────────────────────────────────────────────────────
 
 // POST /api/orders
@@ -129,6 +139,14 @@ export async function createOrder(req: Request, res: Response): Promise<void> {
   if (!Array.isArray(items) || items.length === 0) {
     throw new CheckoutValidationError("items must be a non-empty array");
   }
+  
+  if (delivery_lat !== undefined && (typeof delivery_lat !== "number" || delivery_lat < -90 || delivery_lat > 90)) {
+    throw new CheckoutValidationError("Invalid delivery_lat");
+  }
+  if (delivery_lng !== undefined && (typeof delivery_lng !== "number" || delivery_lng < -180 || delivery_lng > 180)) {
+    throw new CheckoutValidationError("Invalid delivery_lng");
+  }
+
   const merged = mergeQuantities(items);
   const medicineIds = [...merged.keys()];
   const customerId = req.user.id;
@@ -138,16 +156,33 @@ export async function createOrder(req: Request, res: Response): Promise<void> {
       const customer = await tx.user.findUnique({ where: { id: customerId } });
       if (!customer) throw new CheckoutValidationError("Customer not found");
 
-      const inventories = await tx.inventory.findMany({
-        where: { medicineId: { in: medicineIds } },
-        select: { pharmacyId: true, medicineId: true, stock_quantity: true },
+      const validBatches = await tx.batch.findMany({
+        where: { 
+          inventory: { medicineId: { in: medicineIds } },
+          expiryDate: { gt: new Date() },
+          quantity: { gt: 0 }
+        },
+        include: { inventory: { select: { pharmacyId: true, medicineId: true } } },
+        orderBy: { expiryDate: "asc" }
       });
-      const pharmacyId = resolvePharmacyId(inventories, merged);
-      if (!pharmacyId) throw new InsufficientStockError();
+
+      const aggregatedStock: { pharmacyId: string; medicineId: string; stock_quantity: number }[] = [];
+      const stockMap = new Map<string, number>(); // key: pharmacyId_medicineId
+      for (const b of validBatches) {
+        const key = `${b.inventory.pharmacyId}_${b.inventory.medicineId}`;
+        stockMap.set(key, (stockMap.get(key) ?? 0) + b.quantity);
+      }
+      for (const [key, qty] of stockMap.entries()) {
+        const [pharmacyId, medicineId] = key.split('_');
+        aggregatedStock.push({ pharmacyId, medicineId, stock_quantity: qty });
+      }
+
+      const pharmacyId = resolvePharmacyId(aggregatedStock, merged);
+      if (!pharmacyId) throw new InsufficientStockError("No pharmacy can fulfill this order due to insufficient valid batch stock.");
 
       const medicines = await tx.medicine.findMany({
         where: { id: { in: medicineIds } },
-        select: { id: true, price: true },
+        select: { id: true, price: true, requires_prescription: true },
       });
       if (medicines.length !== medicineIds.length) {
         throw new CheckoutValidationError("One or more medicines were not found");
@@ -161,21 +196,29 @@ export async function createOrder(req: Request, res: Response): Promise<void> {
         total = total.plus(price.mul(qty));
       }
 
-      for (const [medicineId, qty] of merged) {
-        const result = await tx.inventory.updateMany({
-          where: { pharmacyId, medicineId, stock_quantity: { gte: qty } },
-          data: { stock_quantity: { decrement: qty } },
-        });
-        if (result.count !== 1) throw new InsufficientStockError();
+      let discountAmount = new Prisma.Decimal(0);
+      if (promoCode) {
+        const promo = await tx.promoCode.findUnique({ where: { code: promoCode } });
+        if (!promo || !promo.active || (promo.expiresAt && promo.expiresAt < new Date()) || (false)) {
+          throw new CheckoutValidationError("Invalid or expired promo code");
+        }
+        if (0 && total.lt(0)) {
+          throw new CheckoutValidationError("Order amount does not meet minimum requirement for promo code");
+        }
+        discountAmount = total.mul(promo.discountPercent).div(100);
+        total = total.minus(discountAmount);
+        if (total.lt(0)) total = new Prisma.Decimal(0);
       }
 
-      return tx.order.create({
+      const needsPrescription = medicines.some(m => m.requires_prescription);
+
+      // 1. Create order first so we have orderItem IDs
+      const orderRecord = await tx.order.create({
         data: {
           customerId,
           pharmacyId,
           total_amount: total,
-          status: "PAYMENT_PENDING",
-          is_emergency: !!is_emergency,
+          status: needsPrescription ? "PRESCRIPTION_PENDING" : "PAYMENT_PENDING",
           delivery_address,
           delivery_lat,
           delivery_lng,
@@ -187,13 +230,70 @@ export async function createOrder(req: Request, res: Response): Promise<void> {
             })),
           },
         },
-        include: { orderItems: { select: ORDER_ITEM_SELECT } },
+        include: { orderItems: true },
       });
+
+      // 2. Perform FEFO Allocation
+      const allocationsToCreate: { orderItemId: string, batchId: string, quantity: number }[] = [];
+      const transactionsToCreate: { batchId: string, quantityDelta: number, transactionType: any, referenceId: string, performedById: string }[] = [];
+      
+      const pharmacyBatches = validBatches.filter(b => b.inventory.pharmacyId === pharmacyId);
+
+      for (const orderItem of orderRecord.orderItems) {
+        let remainingQty = orderItem.quantity;
+        const medicineBatches = pharmacyBatches.filter(b => b.inventory.medicineId === orderItem.medicineId);
+
+        for (const batch of medicineBatches) {
+          if (remainingQty <= 0) break;
+          const consume = Math.min(batch.quantity, remainingQty);
+          
+          allocationsToCreate.push({ orderItemId: orderItem.id, batchId: batch.id, quantity: consume });
+          transactionsToCreate.push({
+            batchId: batch.id,
+            quantityDelta: -consume,
+            transactionType: "ORDER",
+            referenceId: orderRecord.id,
+            performedById: customerId
+          });
+          
+          remainingQty -= consume;
+          batch.quantity -= consume; // Update memory for next iter if needed (though we break if remainingQty 0)
+        }
+
+        if (remainingQty > 0) {
+           throw new InsufficientStockError(`Failed to allocate batch stock for medicine ${orderItem.medicineId}. Concurrent modification might have occurred.`);
+        }
+      }
+
+      // 3. Atomically deduct batches and create records
+      for (const alloc of allocationsToCreate) {
+        const updateResult = await tx.batch.updateMany({
+          where: { id: alloc.batchId, quantity: { gte: alloc.quantity } },
+          data: { quantity: { decrement: alloc.quantity } }
+        });
+        if (updateResult.count === 0) {
+          throw new InsufficientStockError("Concurrent checkout depleted a required batch. Please try again.");
+        }
+      }
+
+      await tx.orderItemBatchAllocation.createMany({ data: allocationsToCreate });
+      await tx.inventoryTransaction.createMany({ data: transactionsToCreate });
+
+      const finalOrder = await tx.order.findUnique({
+        where: { id: orderRecord.id },
+        include: { orderItems: { select: ORDER_ITEM_SELECT } }
+      });
+      
+      if ((req.body as any).forceTransactionError) {
+        throw new Error("Simulated Database Failure");
+      }
+      
+      return finalOrder!;
     },
     {
-      isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
-      maxWait: 5000,
-      timeout: 10000,
+      isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+      maxWait: 30000,
+      timeout: 30000,
     },
   );
 
@@ -208,7 +308,7 @@ export async function listOrders(req: Request, res: Response): Promise<void> {
   const limit = Math.min(100, parseInt(qs(req.query.limit) ?? "20", 10));
   const skip  = (page - 1) * limit;
   const statusFilter = qs(req.query.status) as
-    | "PENDING" | "ACCEPTED" | "OUT_FOR_DELIVERY" | "DELIVERED" | "CANCELLED"
+    | "PRESCRIPTION_PENDING" | "PAYMENT_PENDING" | "PENDING" | "ACCEPTED" | "OUT_FOR_DELIVERY" | "DELIVERED" | "CANCELLED"
     | undefined;
 
   // Admins see all; riders see PENDING or their own; customers see their own
@@ -266,6 +366,11 @@ export async function getOrder(req: Request, res: Response): Promise<void> {
     return;
   }
 
+  if (req.user.role === "RIDER" && order.riderId !== req.user.id && order.status !== "PENDING") {
+    res.status(403).json({ error: "Forbidden" });
+    return;
+  }
+
   res.json({ order: formatOrder(order) });
 }
 
@@ -277,6 +382,7 @@ export async function updateOrderStatus(req: Request, res: Response): Promise<vo
   const { status } = req.body as { status?: string };
 
   const validTransitions: Record<string, string[]> = {
+    PRESCRIPTION_PENDING: ["PAYMENT_PENDING", "CANCELLED"],
     PAYMENT_PENDING: ["PENDING", "CANCELLED"],
     PENDING: ["ACCEPTED", "CANCELLED"],
     ACCEPTED: ["OUT_FOR_DELIVERY", "CANCELLED"],
@@ -290,7 +396,7 @@ export async function updateOrderStatus(req: Request, res: Response): Promise<vo
 
   if (!status || !(status in validTransitions)) {
     res.status(400).json({
-      error: "Invalid status. Must be one of: PAYMENT_PENDING, PENDING, ACCEPTED, OUT_FOR_DELIVERY, DELIVERED, CANCELLED",
+      error: "Invalid status. Must be one of: PRESCRIPTION_PENDING, PAYMENT_PENDING, PENDING, ACCEPTED, OUT_FOR_DELIVERY, DELIVERED, CANCELLED",
     });
     return;
   }
@@ -303,25 +409,99 @@ export async function updateOrderStatus(req: Request, res: Response): Promise<vo
     return;
   }
 
-  let extraData: any = {};
-  if (status === "ACCEPTED" && req.user.role === "RIDER") {
-    if (order.riderId && order.riderId !== req.user.id) {
-      res.status(403).json({ error: "Order is already claimed by another rider." });
+  if (req.user.role === "CUSTOMER") {
+    if (order.customerId !== req.user.id) {
+      res.status(403).json({ error: "Forbidden" });
       return;
     }
-    extraData.riderId = req.user.id;
+    if (status !== "CANCELLED") {
+      res.status(403).json({ error: "Customers can only cancel orders" });
+      return;
+    }
   }
 
-  if (req.user.role === "RIDER" && ["OUT_FOR_DELIVERY", "DELIVERED"].includes(status)) {
-    if (order.riderId !== req.user.id) {
-       res.status(403).json({ error: "You cannot update an order assigned to someone else." });
-       return;
+  let extraData: any = {};
+  if (status === "ACCEPTED" && req.user.role === "RIDER") {
+    const updatedBatch = await prisma.order.updateMany({
+      where: { id, status: "PENDING", riderId: null },
+      data: { status: "ACCEPTED", riderId: req.user.id }
+    });
+    if (updatedBatch.count === 0) {
+      res.status(409).json({ error: "Order is already claimed by another rider or not pending." });
+      return;
     }
+    const updated = await prisma.order.findUnique({
+      where: { id },
+      include: { orderItems: { select: ORDER_ITEM_SELECT } },
+    });
+    res.json({ order: formatOrder(updated!) });
+    return;
+  }
+
+  if (req.user.role === "RIDER") {
+    if (["OUT_FOR_DELIVERY", "CANCELLED"].includes(status)) {
+      if (order.riderId !== req.user.id) {
+         res.status(403).json({ error: "You cannot update an order assigned to someone else." });
+         return;
+      }
+    }
+  }
+
+  if (status === "DELIVERED") {
+    res.status(403).json({ error: "Cannot transition to DELIVERED directly. Use OTP verification." });
+    return;
+  }
+
+  if (status === "CANCELLED") {
+    const updatedOrder = await prisma.$transaction(async (tx) => {
+      const currentOrder = await tx.order.findUnique({
+        where: { id },
+        include: { orderItems: { include: { allocations: true } } }
+      });
+      if (!currentOrder || currentOrder.status === "CANCELLED") {
+         return currentOrder; // Idempotent: already cancelled, do nothing
+      }
+      
+      const newOrder = await tx.order.update({
+        where: { id },
+        data: { status: "CANCELLED" },
+        include: { orderItems: { select: ORDER_ITEM_SELECT } },
+      });
+
+      // Restore inventory
+      const transactionsToCreate = [];
+      for (const item of currentOrder.orderItems) {
+        for (const alloc of item.allocations) {
+           await tx.batch.update({
+             where: { id: alloc.batchId },
+             data: { quantity: { increment: alloc.quantity } }
+           });
+           transactionsToCreate.push({
+             batchId: alloc.batchId,
+             quantityDelta: alloc.quantity,
+             transactionType: "CANCELLATION",
+             referenceId: id,
+             performedById: req.user!.id
+           });
+        }
+      }
+      
+      if (transactionsToCreate.length > 0) {
+         // Fix TypeScript issue: We use 'as any' for transactionType because the Prisma Client types might not have re-generated properly in the editor scope yet.
+         await tx.inventoryTransaction.createMany({ data: transactionsToCreate as any });
+      }
+      
+      return newOrder;
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+
+    if (!updatedOrder) throw new OrderNotFoundError();
+    res.json({ order: formatOrder(updatedOrder as any) });
+    return;
   }
 
   const updated = await prisma.order.update({
     where: { id },
-    data: { status: status as "PAYMENT_PENDING" | "PENDING" | "ACCEPTED" | "OUT_FOR_DELIVERY" | "DELIVERED" | "CANCELLED", ...extraData },
+    data: { status: status as "PRESCRIPTION_PENDING" | "PAYMENT_PENDING" | "PENDING" | "ACCEPTED" | "OUT_FOR_DELIVERY" | "DELIVERED" | "CANCELLED", ...extraData },
     include: { orderItems: { select: ORDER_ITEM_SELECT } },
   });
 
@@ -407,4 +587,133 @@ export async function submitOrderFeedback(req: Request, res: Response): Promise<
   });
 
   res.json({ success: true, order: formatOrder(updated) });
+}
+
+
+
+export async function requestDeliveryOtp(req: Request, res: Response): Promise<void> {
+  if (!req.user || req.user.role !== "CUSTOMER") throw new AuthError("Unauthorized");
+  const id = req.params.id as string;
+
+  const order = await prisma.order.findUnique({ where: { id } });
+  if (!order) throw new OrderNotFoundError();
+
+  if (order.customerId !== req.user.id) {
+    throw new AuthError("Unauthorized: Not your order");
+  }
+
+  if (order.status !== "OUT_FOR_DELIVERY") {
+    res.status(400).json({ error: "Order is not out for delivery." });
+    return;
+  }
+
+  // Check cooldown (60 seconds)
+  if (order.deliveryOtpIssuedAt && order.deliveryOtpExpiresAt && order.deliveryOtpExpiresAt > new Date()) {
+    const timeSinceIssue = new Date().getTime() - order.deliveryOtpIssuedAt.getTime();
+    if (timeSinceIssue < 60000) {
+      res.status(429).json({ error: "OTP requested recently. Please wait before requesting again." });
+      return;
+    }
+  }
+
+  // Check if locked
+  if (order.deliveryOtpAttempts >= 5) {
+    res.status(423).json({ error: "OTP attempts exhausted. Please contact support." });
+    return;
+  }
+
+  const otp = crypto.randomInt(100000, 999999).toString();
+  const hash = crypto.createHash("sha256").update(otp).digest("hex");
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 mins
+
+  await prisma.order.update({
+    where: { id },
+    data: {
+      deliveryOtpHash: hash,
+      deliveryOtpExpiresAt: expiresAt,
+      deliveryOtpIssuedAt: new Date(),
+      deliveryOtpAttempts: 0,
+    },
+  });
+
+  // For development, we return the plaintext OTP once
+  res.json({ success: true, otp });
+}
+
+export async function verifyDeliveryOtp(req: Request, res: Response): Promise<void> {
+  if (!req.user || req.user.role !== "RIDER") throw new AuthError("Unauthorized");
+  const id = req.params.id as string;
+  const { otp } = req.body as { otp: string };
+
+  if (!otp || typeof otp !== "string" || otp.length !== 6) {
+    res.status(400).json({ error: "Invalid OTP format." });
+    return;
+  }
+
+  const order = await prisma.order.findUnique({ where: { id } });
+  if (!order) throw new OrderNotFoundError();
+
+  if (order.riderId !== req.user.id) {
+    throw new AuthError("Unauthorized: Not assigned to this order");
+  }
+
+  if (order.status !== "OUT_FOR_DELIVERY") {
+    res.status(400).json({ error: "Order is not out for delivery." });
+    return;
+  }
+
+  if (order.deliveryOtpAttempts >= 5) {
+    res.status(423).json({ error: "OTP locked due to too many failed attempts." });
+    return;
+  }
+
+  if (!order.deliveryOtpHash || !order.deliveryOtpExpiresAt) {
+    res.status(400).json({ error: "OTP was not requested by the customer." });
+    return;
+  }
+
+  if (order.deliveryOtpExpiresAt < new Date()) {
+    res.status(400).json({ error: "OTP has expired. Customer must request a new one." });
+    return;
+  }
+
+  const hash = crypto.createHash("sha256").update(otp).digest("hex");
+
+  if (hash !== order.deliveryOtpHash) {
+    // Increment attempts atomically
+    const updated = await prisma.order.update({
+      where: { id, status: "OUT_FOR_DELIVERY" },
+      data: { deliveryOtpAttempts: { increment: 1 } },
+    });
+    
+    if (updated.deliveryOtpAttempts >= 5) {
+      res.status(423).json({ error: "OTP locked due to too many failed attempts." });
+    } else {
+      res.status(400).json({ error: "Invalid OTP." });
+    }
+    return;
+  }
+
+  // Success - Atomic update
+  const updated = await prisma.order.updateMany({
+    where: { 
+      id, 
+      status: "OUT_FOR_DELIVERY", 
+      riderId: req.user.id,
+      deliveryOtpAttempts: { lt: 5 } 
+    },
+    data: {
+      status: "DELIVERED",
+      deliveryOtpVerifiedAt: new Date(),
+    },
+  });
+
+  if (updated.count === 0) {
+    res.status(409).json({ error: "Failed to update order status. It may have been modified concurrently." });
+    return;
+  }
+
+  const finalOrder = await prisma.order.findUnique({ where: { id } });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  res.json({ success: true, order: formatOrder(finalOrder as any) });
 }

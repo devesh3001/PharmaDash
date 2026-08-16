@@ -77,13 +77,26 @@ async function main() {
     "Paracetamol 500 mg tablets": 300,
   };
 
-  await prisma.inventory.createMany({
+  const inventories = await prisma.inventory.createManyAndReturn({
     data: created.map((m) => ({
       pharmacyId: pharmacy.id,
       medicineId: m.id,
-      stock_quantity: stockByName[m.name] ?? 50,
     })),
   });
+
+  const batchesToCreate = inventories.map(inv => {
+    const medName = created.find(m => m.id === inv.medicineId)?.name || "";
+    const qty = stockByName[medName] ?? 50;
+    return {
+      inventoryId: inv.id,
+      batchNumber: `SEED-${inv.id}`,
+      quantity: qty,
+      expiryDate: new Date("2099-12-31"),
+      isLegacy: true,
+    };
+  });
+
+  await prisma.batch.createMany({ data: batchesToCreate });
 
   // ── Summary ───────────────────────────────────────────────────────────────
   console.log("\n✅ Seed complete.");

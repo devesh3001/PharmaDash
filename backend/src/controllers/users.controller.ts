@@ -50,8 +50,8 @@ export async function updateMe(req: Request, res: Response): Promise<void> {
   }
 
   if (password !== undefined) {
-    if (typeof password !== "string" || password.length < 4) {
-      res.status(400).json({ error: "password must be at least 4 characters" });
+    if (typeof password !== "string" || password.length < 8) {
+      res.status(400).json({ error: "password must be at least 8 characters" });
       return;
     }
     data.password_hash = await bcrypt.hash(password, SALT_ROUNDS);
@@ -73,8 +73,8 @@ export async function updateMe(req: Request, res: Response): Promise<void> {
 
 // GET /api/users?page=&limit=   (ADMIN only)
 export async function listUsers(req: Request, res: Response): Promise<void> {
-  const page = Math.max(1, parseInt(String(req.query.page ?? "1"), 10));
-  const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? "20"), 10)));
+  const page = Math.max(1, parseInt(String(req.query.page ?? "1"), 10) || 1);
+  const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? "20"), 10) || 20));
   const skip = (page - 1) * limit;
   const role = typeof req.query.role === "string" ? req.query.role : undefined;
 

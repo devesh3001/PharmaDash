@@ -18,58 +18,180 @@ function StatCard({ icon, label, value, color }) {
   );
 }
 
-/* ── Inventory Row ───────────────────────────────────────────── */
 function InventoryRow({ item, onSave }) {
-  const [editing, setEditing] = useState(false);
-  const [qty,     setQty]     = useState(item.stock_quantity);
-  const [busy,    setBusy]    = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const [batches, setBatches] = useState(null);
+  const [loading, setLoading] = useState(false);
   const toast = useToast();
 
-  async function save() {
-    setBusy(true);
+  const loadBatches = async () => {
+    setLoading(true);
     try {
-      await api.updateStock(item.id, parseInt(qty));
-      toast.success(`Stock updated to ${qty} units`);
-      onSave();
-      setEditing(false);
-    } catch (e) { toast.error(e.message); }
-    finally { setBusy(false); }
-  }
+      const { inventory } = await api.getInventoryItem(item.id);
+      setBatches(inventory.batches || []);
+    } catch (e) {
+      toast.error('Failed to load batches: ' + e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (expanded && !batches) loadBatches();
+  }, [expanded]);
 
   const low = item.stock_quantity < 20;
 
   return (
-    <tr className={`inv-row ${low ? 'inv-low' : ''}`}>
-      <td className="inv-name">
-        <span className="inv-med-name">{item.medicine?.name}</span>
-        <span className="inv-generic">{item.medicine?.generic_name}</span>
-      </td>
-      <td className="inv-pharmacy">{item.pharmacy?.name}</td>
-      <td className="inv-price">₹{parseFloat(item.medicine?.price ?? 0).toFixed(2)}</td>
-      <td className="inv-stock">
-        {editing ? (
-          <input
-            className="stock-input"
-            type="number"
-            min="0"
-            value={qty}
-            onChange={e => setQty(e.target.value)}
-          />
-        ) : (
+    <>
+      <tr className={`inv-row ${low ? 'inv-low' : ''}`}>
+        <td className="inv-name">
+          <span className="inv-med-name">{item.medicine?.name}</span>
+          <span className="inv-generic">{item.medicine?.generic_name}</span>
+        </td>
+        <td className="inv-pharmacy">{item.pharmacy?.name}</td>
+        <td className="inv-price">₹{parseFloat(item.medicine?.price ?? 0).toFixed(2)}</td>
+        <td className="inv-stock">
           <span className={`stock-val ${low ? 'low' : ''}`}>{item.stock_quantity}</span>
-        )}
-      </td>
-      <td className="inv-actions">
-        {editing ? (
-          <>
-            <button className="btn-save" onClick={save} disabled={busy}>{busy ? <span className="spinner-sm" /> : 'Save'}</button>
-            <button className="btn-cancel" onClick={() => { setEditing(false); setQty(item.stock_quantity); }}>Cancel</button>
-          </>
-        ) : (
-          <button className="btn-edit" onClick={() => setEditing(true)}>Edit</button>
-        )}
-      </td>
-    </tr>
+        </td>
+        <td className="inv-actions">
+          <button className="btn-edit" onClick={() => setExpanded(!expanded)}>
+            {expanded ? 'Hide Batches' : 'Manage Batches'}
+          </button>
+        </td>
+      </tr>
+      {expanded && (
+        <tr className="inv-expanded-row">
+          <td colSpan="5" className="p-0">
+            <div className="batch-panel">
+              {loading && <div className="spinner-sm" style={{ margin: '16px auto' }} />}
+              {!loading && batches && (
+                <BatchManager inventoryId={item.id} batches={batches} onSave={() => { loadBatches(); onSave(); }} />
+              )}
+            </div>
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+function BatchManager({ inventoryId, batches, onSave }) {
+  const [showAdd, setShowAdd] = useState(false);
+  const [adjustingId, setAdjustingId] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const toast = useToast();
+
+  const [newBatch, setNewBatch] = useState({ batchNumber: '', quantity: '', expiryDate: '' });
+  const [adjust, setAdjust] = useState({ delta: '', transactionType: 'ADJUSTMENT' });
+
+  const handleAdd = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      await api.addBatch(inventoryId, {
+        batchNumber: newBatch.batchNumber,
+        quantity: parseInt(newBatch.quantity, 10),
+        expiryDate: new Date(newBatch.expiryDate).toISOString(),
+      });
+      toast.success('Batch added');
+      setShowAdd(false);
+      setNewBatch({ batchNumber: '', quantity: '', expiryDate: '' });
+      onSave();
+    } catch (e) {
+      toast.error(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleAdjust = async (e, batchId) => {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      await api.adjustBatchStock(batchId, {
+        delta: parseInt(adjust.delta, 10),
+        transactionType: adjust.transactionType,
+      });
+      toast.success('Stock adjusted');
+      setAdjustingId(null);
+      setAdjust({ delta: '', transactionType: 'ADJUSTMENT' });
+      onSave();
+    } catch (e) {
+      toast.error(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="batch-manager">
+      <div className="bm-header">
+        <h4>Batch Inventory</h4>
+        <button className="btn-outline-sm" onClick={() => setShowAdd(!showAdd)}>+ Add Batch</button>
+      </div>
+
+      {showAdd && (
+        <form className="bm-form" onSubmit={handleAdd}>
+          <input required placeholder="Batch #" value={newBatch.batchNumber} onChange={e => setNewBatch({ ...newBatch, batchNumber: e.target.value })} />
+          <input required type="number" min="1" placeholder="Qty" value={newBatch.quantity} onChange={e => setNewBatch({ ...newBatch, quantity: e.target.value })} />
+          <input required type="date" title="Expiry Date" value={newBatch.expiryDate} onChange={e => setNewBatch({ ...newBatch, expiryDate: e.target.value })} />
+          <button type="submit" disabled={busy} className="btn-save">Save Batch</button>
+          <button type="button" onClick={() => setShowAdd(false)} className="btn-cancel">Cancel</button>
+        </form>
+      )}
+
+      {batches.length === 0 ? (
+        <p className="bm-empty">No active batches.</p>
+      ) : (
+        <table className="bm-table">
+          <thead>
+            <tr>
+              <th>Batch</th>
+              <th>Qty</th>
+              <th>Expiry</th>
+              <th>Status</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {batches.map(b => (
+              <tr key={b.id}>
+                <td>{b.batchNumber}</td>
+                <td>{b.quantity}</td>
+                <td>
+                  {b.isLegacy ? (
+                    <span className="badge-legacy">Legacy (Unknown)</span>
+                  ) : (
+                    new Date(b.expiryDate).toLocaleDateString('en-IN')
+                  )}
+                </td>
+                <td>
+                  {b.isLegacy ? '-' : (new Date(b.expiryDate) < new Date() ? <span className="badge-expired">Expired</span> : 'Active')}
+                </td>
+                <td>
+                  {adjustingId === b.id ? (
+                    <form className="bm-adjust-form" onSubmit={(e) => handleAdjust(e, b.id)}>
+                      <input required type="number" placeholder="+/-" value={adjust.delta} onChange={e => setAdjust({ ...adjust, delta: e.target.value })} style={{ width: '60px' }} />
+                      <select value={adjust.transactionType} onChange={e => setAdjust({ ...adjust, transactionType: e.target.value })}>
+                        <option value="ADJUSTMENT">Adjust</option>
+                        <option value="DAMAGED">Damaged</option>
+                        <option value="EXPIRED">Expired</option>
+                        <option value="RETURN">Return</option>
+                      </select>
+                      <button type="submit" disabled={busy} className="btn-save-sm">OK</button>
+                      <button type="button" onClick={() => setAdjustingId(null)} className="btn-cancel-sm">X</button>
+                    </form>
+                  ) : (
+                    <button className="btn-edit-sm" onClick={() => { setAdjustingId(b.id); setAdjust({ delta: '', transactionType: 'ADJUSTMENT' }); }}>Adjust</button>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
   );
 }
 
@@ -109,7 +231,20 @@ export function AdminDashboard() {
     lowStock:  inventory.filter(i => i.stock_quantity < 20).length,
   };
 
-  const TAB_LABELS = { overview: '📊 Overview', orders: '📋 Orders', inventory: '📦 Inventory', users: '👥 Users' };
+  const isAdmin = user?.role === 'ADMIN';
+
+  const TAB_LABELS = { 
+    ...(isAdmin ? { overview: '📊 Overview' } : {}),
+    orders: '📋 Orders',
+    inventory: '📦 Inventory',
+    ...(isAdmin ? { users: '👥 Users' } : {})
+  };
+
+  useEffect(() => {
+    if (!isAdmin && (tab === 'overview' || tab === 'users')) {
+      setTab('orders');
+    }
+  }, [isAdmin, tab]);
 
   return (
     <div className="dash-layout">

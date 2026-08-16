@@ -7,6 +7,28 @@ import { api } from '../api/client';
 const DELIVERY_FEE = 29;
 const FREE_THRESHOLD = 499;
 
+// Paste this at Line 9
+async function getGpsFromAddress(addressText) {
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(addressText)}`;
+    const response = await fetch(url, {
+      headers: {
+        // Nominatim requires a User-Agent or it silently blocks the request
+        'Accept-Language': 'en-US,en;q=0.9',
+        'User-Agent': 'PharmaDash-Delivery-App/1.0' 
+      }
+    });
+    const data = await response.json();
+    
+    if (data && data.length > 0) {
+      return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) };
+    }
+    return null; // Address not found
+  } catch (error) {
+    console.error("Geocoding error:", error);
+    return null;
+  }
+}
 export function CartDrawer() {
   const { items, open, setOpen, updateQty, removeItem, clearCart, total } = useCart();
   const toast = useToast();
@@ -15,6 +37,9 @@ export function CartDrawer() {
   const [promo, setPromo]     = useState('');
   const [promoApplied, setPromoApplied] = useState(false);
   const [showDeliveryModal, setShowDeliveryModal] = useState(false);
+
+  // 👉 ADD THIS NEW LINE HERE:
+  const [buildingName, setBuildingName] = useState('');
   const [deliveryAddress, setDeliveryAddress] = useState('');
   const [deliveryLat, setDeliveryLat] = useState(null);
   const [deliveryLng, setDeliveryLng] = useState(null);
@@ -31,7 +56,14 @@ export function CartDrawer() {
   const toFreeDelivery = FREE_THRESHOLD - total;
 
   function handleCheckout() {
-    setShowDeliveryModal(true);
+    const rxRequired = items.some(i => i.medicine.requires_prescription);
+    if (rxRequired) {
+      // For prescription orders, skip the payment modal and go straight to order creation.
+      // Payment happens after pharmacist approval.
+      confirmPayment(true);
+    } else {
+      setShowDeliveryModal(true);
+    }
   }
 
   function continueToPayment() {
@@ -64,25 +96,70 @@ export function CartDrawer() {
     );
   }
 
-  async function confirmPayment() {
+  async function confirmPayment(isRxOrder = false) {
     setLoading(true);
     setError('');
     try {
+      let finalLat = deliveryLat;
+      let finalLng = deliveryLng;
+      
+      // 1. The Map ONLY searches the street/city (deliveryAddress)
+      if (!finalLat && deliveryAddress.trim()) {
+         toast.info('Locating your address on the map...'); 
+         const coords = await getGpsFromAddress(deliveryAddress);
+         
+         if (coords) {
+           finalLat = coords.lat;
+           finalLng = coords.lng;
+         } else {
+            setLoading(false);
+            toast.error("Address too complex! Try just your Street, City, and State, or use the GPS button.");
+            return; 
+         }
+      }
+
+      // 2. Combine them for the Rider so they know exactly which room to go to!
+      const finalFullAddress = buildingName.trim() 
+        ? `${buildingName}, ${deliveryAddress}` 
+        : deliveryAddress;
+
       const { order } = await api.createOrder({
         items: items.map(i => ({ medicineId: i.medicine.id, quantity: i.quantity })),
-        delivery_address: deliveryAddress,
-        delivery_lat: deliveryLat,
-        delivery_lng: deliveryLng,
+        delivery_address: finalFullAddress || "Address provided later", // Avoid empty if skipped for RX
+        delivery_lat: finalLat, 
+        delivery_lng: finalLng, 
         is_emergency: isEmergency,
+        promoCode: promoApplied ? promo.trim().toUpperCase() : undefined
       });
-      await api.processPayment(order.id, { method: paymentMethod });
+      
       clearCart();
       setOpen(false);
       setShowPaymentModal(false);
       setPromoApplied(false);
       setPromo('');
-      toast.success('Order placed successfully! 🚀');
+
+      if (order.status === 'PRESCRIPTION_PENDING') {
+        toast.info('Order placed! Please upload your prescription.');
+        navigate(`/orders/${order.id}`);
+        return;
+      }
+
+      // Non-Rx order: initiate payment
+      // Backend returns Razorpay checkout data (or simple success for COD/local mode)
+      const checkoutData = await api.processPayment(order.id, {});
+
+      if (!checkoutData.razorpayOrderId) {
+        // Local / COD mode — backend already completed payment
+        toast.success('Order placed successfully! 🚀');
+        navigate(`/orders/${order.id}`);
+        return;
+      }
+
+      // Razorpay mode — navigate first, let OrderDetailPage handle the checkout
+      // This avoids a complex checkout modal inside the CartDrawer
+      toast.info('Redirecting to payment...');
       navigate(`/orders/${order.id}`);
+
     } catch (e) {
       setError(e.message);
       toast.error(e.message);
@@ -206,13 +283,20 @@ export function CartDrawer() {
                 🕐 Estimated delivery: <strong>30–45 min</strong>
               </div>
 
+              {items.some(i => i.medicine.requires_prescription) && (
+                <div style={{ background: 'rgba(239, 68, 68, 0.1)', padding: '12px', borderRadius: 'var(--r-sm)', border: '1px solid var(--red)', marginBottom: '16px' }}>
+                  <div style={{ color: 'var(--red)', fontWeight: '600', fontSize: '14px', marginBottom: '4px' }}>⚠ Prescription Required</div>
+                  <div style={{ color: 'var(--text)', fontSize: '12px' }}>You will be prompted to upload a prescription after placing the order.</div>
+                </div>
+              )}
+
               <button
                 id="place-order-btn"
                 className="btn-checkout"
                 onClick={handleCheckout}
                 disabled={loading}
               >
-                {loading ? <span className="spinner-sm" /> : `🚀 Place Order — ₹${grandTotal.toFixed(2)}`}
+                {loading ? <span className="spinner-sm" /> : (items.some(i => i.medicine.requires_prescription) ? 'Place Order & Upload Rx' : `🚀 Place Order — ₹${grandTotal.toFixed(2)}`)}
               </button>
             </div>
           </>
@@ -227,20 +311,39 @@ export function CartDrawer() {
               <h3 style={{ color: 'var(--white)' }}>Delivery Details</h3>
               <p style={{ color: 'var(--text2)', fontSize: '14px' }}>Where should we deliver your order?</p>
             </div>
+           //changed  
             <div className="modal-content" style={{ display: 'flex', flexDirection: 'column', gap: '16px', marginTop: '16px' }}>
               
+              {/* 👉 NEW INPUT 1: Building / Flat / Room */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                <label style={{ fontSize: '14px', color: 'var(--text)', fontWeight: '500' }}>Address</label>
+                <label style={{ fontSize: '14px', color: 'var(--text)', fontWeight: '500' }}>
+                  Flat, House no., Building, Apartment
+                </label>
+                <input 
+                  className="input-field" 
+                  type="text"
+                  placeholder="e.g., Satish Dhawan Hostel, Room 42"
+                  value={buildingName}
+                  onChange={e => setBuildingName(e.target.value)}
+                />
+              </div>
+
+              {/* 👉 UPDATED INPUT 2: Street / City / State */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                <label style={{ fontSize: '14px', color: 'var(--text)', fontWeight: '500' }}>
+                  Area, Street, City, State
+                </label>
                 <textarea 
                   className="input-field" 
-                  rows="3" 
-                  placeholder="Enter complete address (House/Flat No, Street, Landmark)"
+                  rows="2" 
+                  placeholder="e.g., IIT BHU Campus, Varanasi, UP"
                   value={deliveryAddress}
                   onChange={e => setDeliveryAddress(e.target.value)}
                   style={{ resize: 'none' }}
                 />
               </div>
 
+              {/* GPS Button Container (Unchanged) */}
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'var(--surface)', padding: '12px', borderRadius: 'var(--r-sm)', border: '1px solid var(--border)' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                   <span>📍</span>
@@ -256,6 +359,8 @@ export function CartDrawer() {
                   {locating ? 'Locating...' : (deliveryLat ? 'Update' : 'Locate Me')}
                 </button>
               </div>
+              
+              {/* The rest of your modal buttons (Cancel / Continue) go below here... */}
 
               {/* SOS Toggle */}
               <div style={{ 

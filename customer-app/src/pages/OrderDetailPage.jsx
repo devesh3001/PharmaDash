@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { api } from '../api/client';
 import { Navbar } from '../components/Navbar';
@@ -7,8 +7,8 @@ import { StatusBadge } from '../components/StatusBadge';
 import { TrackingScreen } from '../App.jsx';
 import { useToast } from '../context/ToastContext';
 
-const STEPS = ['PENDING', 'ACCEPTED', 'OUT_FOR_DELIVERY', 'DELIVERED'];
-const STEP_LABELS = { PENDING: 'Order Placed', ACCEPTED: 'Accepted', OUT_FOR_DELIVERY: 'On the Way', DELIVERED: 'Delivered' };
+const STEPS = ['PRESCRIPTION_PENDING', 'PAYMENT_PENDING', 'PENDING', 'ACCEPTED', 'OUT_FOR_DELIVERY', 'DELIVERED'];
+const STEP_LABELS = { PRESCRIPTION_PENDING: 'Prescription', PAYMENT_PENDING: 'Payment', PENDING: 'Order Placed', ACCEPTED: 'Accepted', OUT_FOR_DELIVERY: 'On the Way', DELIVERED: 'Delivered' };
 
 function FeedbackCard({ orderId, existingRating, existingFeedback, onSubmitted }) {
   const [rating, setRating] = useState(existingRating || 0);
@@ -83,13 +83,55 @@ export function OrderDetailPage() {
   const [order,   setOrder]   = useState(null);
   const [loading, setLoading] = useState(true);
   const [error,   setError]   = useState('');
+  const [uploadingRx, setUploadingRx] = useState(false);
+  const [processingPayment, setProcessingPayment] = useState(false);
+  const [rxFile, setRxFile] = useState(null);
+  const [hasUploadedRx, setHasUploadedRx] = useState(() => localStorage.getItem(`rx_uploaded_${id}`) === 'true');
+  const pollTimer = useRef(null);
+  const toast = useToast();
+
+  const fetchOrder = async () => {
+    try {
+      const { order: data } = await api.getOrder(id);
+      setOrder(data);
+      return data;
+    } catch (e) {
+      setError(e.message);
+      return null;
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
-    api.getOrder(id)
-      .then(({ order }) => setOrder(order))
-      .catch(e => setError(e.message))
-      .finally(() => setLoading(false));
+    fetchOrder();
   }, [id]);
+
+  useEffect(() => {
+    // Clean up timer on unmount
+    return () => {
+      if (pollTimer.current) clearInterval(pollTimer.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (order && order.status === 'PRESCRIPTION_PENDING') {
+      if (!pollTimer.current) {
+        pollTimer.current = setInterval(async () => {
+          const freshOrder = await fetchOrder();
+          if (freshOrder && freshOrder.status !== 'PRESCRIPTION_PENDING') {
+            clearInterval(pollTimer.current);
+            pollTimer.current = null;
+          }
+        }, 5000);
+      }
+    } else {
+      if (pollTimer.current) {
+        clearInterval(pollTimer.current);
+        pollTimer.current = null;
+      }
+    }
+  }, [order?.status]);
 
   const total = order?.orderItems?.reduce(
     (s, i) => s + parseFloat(i.unit_price) * i.quantity, 0
@@ -97,6 +139,134 @@ export function OrderDetailPage() {
 
   const stepIdx    = order ? STEPS.indexOf(order.status) : -1;
   const isCancelled = order?.status === 'CANCELLED';
+
+  async function handleRxUpload(e) {
+    if (e.target.files && e.target.files[0]) {
+      setRxFile(e.target.files[0]);
+    }
+  }
+
+  async function submitRxUpload() {
+    if (!rxFile) return;
+    
+    setUploadingRx(true);
+    const formData = new FormData();
+    formData.append('prescription', rxFile);
+
+    try {
+      await api.uploadPrescription(order.id, formData);
+      toast.success('Prescription uploaded successfully!');
+      localStorage.setItem(`rx_uploaded_${order.id}`, 'true');
+      setHasUploadedRx(true);
+      setRxFile(null);
+      await fetchOrder();
+    } catch (err) {
+      toast.error(err.message);
+    } finally {
+      setUploadingRx(false);
+    }
+  }
+
+  const [confirmingPayment, setConfirmingPayment] = useState(false);
+
+  function loadRazorpayScript() {
+    return new Promise((resolve) => {
+      if (document.getElementById('razorpay-checkout-js')) { resolve(true); return; }
+      const script = document.createElement('script');
+      script.id = 'razorpay-checkout-js';
+      script.src = 'https://checkout.razorpay.com/v1/checkout.js';
+      script.onload = () => resolve(true);
+      script.onerror = () => resolve(false);
+      document.body.appendChild(script);
+    });
+  }
+
+  async function handlePayment() {
+    setProcessingPayment(true);
+    setConfirmingPayment(false);
+    try {
+      // 1. Call backend — backend calculates authoritative amount from DB
+      const checkoutData = await api.processPayment(order.id, {});
+
+      // 2. Local/COD mode: backend already transitioned the order
+      if (!checkoutData.razorpayOrderId) {
+        toast.success('Payment processed successfully!');
+        const { order: updated } = await api.getOrder(order.id);
+        setOrder(updated);
+        return;
+      }
+
+      // 3. Razorpay mode: load SDK and open checkout
+      const loaded = await loadRazorpayScript();
+      if (!loaded) {
+        toast.error('Failed to load payment gateway. Please try again.');
+        return;
+      }
+
+      await new Promise((resolve, reject) => {
+        const options = {
+          key: checkoutData.keyId,              // Only KEY_ID, never the secret
+          amount: checkoutData.amount,          // In paise, from DB
+          currency: checkoutData.currency,
+          order_id: checkoutData.razorpayOrderId,
+          name: 'PharmaDash',
+          description: `Order #${order.id.slice(-8).toUpperCase()}`,
+          theme: { color: '#00bfad' },
+          handler: () => {
+            // Frontend callback fires — but we do NOT trust it for final state
+            // Instead we show confirming state and poll the backend
+            setConfirmingPayment(true);
+            resolve(null);
+          },
+          modal: {
+            ondismiss: () => {
+              // User closed without paying
+              reject(new Error('Payment cancelled'));
+            }
+          }
+        };
+        const rzp = new window.Razorpay(options);
+        rzp.open();
+      });
+
+      // 4. Poll backend until order leaves PAYMENT_PENDING (max ~2 min)
+      toast.info('Payment submitted — confirming payment...');
+      let attempts = 0;
+      const maxAttempts = 40; // 40 × 3s = 2 minutes
+      const poll = setInterval(async () => {
+        attempts++;
+        try {
+          const { order: updated } = await api.getOrder(order.id);
+          if (updated.status !== 'PAYMENT_PENDING') {
+            clearInterval(poll);
+            setConfirmingPayment(false);
+            setOrder(updated);
+            if (updated.status === 'PENDING') {
+              toast.success('Payment confirmed! Your order is placed. 🚀');
+            } else if (updated.status === 'CANCELLED') {
+              toast.error('Order was cancelled.');
+            } else {
+              toast.info(`Order status: ${updated.status}`);
+            }
+          } else if (attempts >= maxAttempts) {
+            clearInterval(poll);
+            setConfirmingPayment(false);
+            toast.error('Payment confirmation timed out. Please refresh or contact support.');
+          }
+        } catch {
+          // network error during poll — keep trying
+        }
+      }, 3000);
+
+    } catch (err) {
+      if (err.message !== 'Payment cancelled') {
+        toast.error(err.message);
+      }
+    } finally {
+      setProcessingPayment(false);
+    }
+  }
+
 
   return (
     <div className="app-layout">
@@ -144,19 +314,142 @@ export function OrderDetailPage() {
               </div>
             )}
 
+            {order.status === 'PRESCRIPTION_PENDING' && (
+              <div className="od-section" style={{ background: 'var(--blue-dim)', borderColor: 'var(--blue)' }}>
+                <h2 className="od-section-title" style={{ color: 'var(--blue)' }}>Prescription Required</h2>
+                
+                {hasUploadedRx ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    <p style={{ color: 'var(--text)', fontSize: '14px', margin: 0 }}>
+                      ✅ Your prescription has been uploaded.
+                    </p>
+                    <p style={{ color: 'var(--blue)', fontSize: '14px', margin: 0, fontWeight: 500 }}>
+                      Prescription under pharmacist review...
+                    </p>
+                    <span className="spinner-sm" style={{ alignSelf: 'flex-start', marginTop: '8px', filter: 'brightness(2)' }} />
+                  </div>
+                ) : (
+                  <>
+                    <p style={{ color: 'var(--text)', fontSize: '14px', marginBottom: '16px' }}>
+                      One or more medicines in your order require a valid prescription. Please upload it for verification by our pharmacists.
+                    </p>
+                    
+                    {!rxFile ? (
+                      <>
+                        <input 
+                          type="file" 
+                          id="rx-upload" 
+                          hidden 
+                          onChange={handleRxUpload} 
+                          accept="image/jpeg,image/png,image/webp,application/pdf"
+                          disabled={uploadingRx}
+                        />
+                        <label htmlFor="rx-upload" className="btn-primary" style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+                          📄 Select Prescription File
+                        </label>
+                      </>
+                    ) : (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                        <div style={{ background: 'var(--surface)', padding: '12px', borderRadius: 'var(--r-sm)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                          <div>
+                            <div style={{ color: 'var(--white)', fontSize: '14px' }}>{rxFile.name}</div>
+                            <div style={{ color: 'var(--text2)', fontSize: '12px' }}>{(rxFile.size / 1024 / 1024).toFixed(2)} MB</div>
+                          </div>
+                          <button className="btn-outline-sm" onClick={() => setRxFile(null)} disabled={uploadingRx}>✕</button>
+                        </div>
+                        <button 
+                          className="btn-primary" 
+                          onClick={submitRxUpload}
+                          disabled={uploadingRx}
+                          style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}
+                        >
+                          {uploadingRx ? <span className="spinner-sm" /> : 'Confirm & Upload'}
+                        </button>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+
+            {order.status === 'PAYMENT_PENDING' && (
+              <div className="od-section" style={{ background: 'var(--blue-dim)', borderColor: 'var(--blue)' }}>
+                <h2 className="od-section-title" style={{ color: 'var(--blue)' }}>Payment Required</h2>
+                <p style={{ color: 'var(--text)', fontSize: '14px', marginBottom: '16px' }}>
+                  Your prescription has been verified. Please complete your payment to confirm the order.
+                </p>
+                <button 
+                  className="btn-primary" 
+                  onClick={handlePayment}
+                  disabled={processingPayment || confirmingPayment}
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: '8px' }}
+                >
+                  {confirmingPayment
+                    ? <><span className="spinner-sm" /> Confirming payment...</>
+                    : processingPayment
+                    ? <span className="spinner-sm" />
+                    : `💳 Pay ₹${total.toFixed(2)}`}
+                </button>
+              </div>
+            )}
+
             {order.status === 'DELIVERED' && (
               <FeedbackCard 
                 orderId={order.id} 
                 existingRating={order.rating} 
                 existingFeedback={order.feedback}
                 onSubmitted={() => {
-                  api.getOrder(order.id).then(({ data }) => setOrder(data));
+                  api.getOrder(order.id).then(({ order }) => setOrder(order));
                 }} 
               />
             )}
 
-            {!isCancelled && ['ACCEPTED', 'OUT_FOR_DELIVERY'].includes(order.status) && (
-              <TrackingScreen key={order.id} orderId={order.id} />
+            {order.status === 'OUT_FOR_DELIVERY' && (
+              <div className="od-section" style={{ background: 'var(--green-dim)', borderColor: 'var(--green)' }}>
+                <h2 className="od-section-title" style={{ color: 'var(--green)' }}>Delivery OTP</h2>
+                <p style={{ color: 'var(--text)', fontSize: '14px', marginBottom: '16px' }}>
+                  Provide this OTP to your rider to confirm the delivery.
+                </p>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  {order._activeOtp ? (
+                    <div style={{ padding: '12px', background: 'var(--surface)', borderRadius: 'var(--r-sm)', fontSize: '24px', letterSpacing: '4px', textAlign: 'center', fontWeight: 'bold' }}>
+                      {order._activeOtp}
+                    </div>
+                  ) : (
+                    <button 
+                      className="btn-primary" 
+                      onClick={async () => {
+                        try {
+                          const { otp } = await api.requestDeliveryOtp(order.id);
+                          toast.success('OTP Generated');
+                          setOrder(prev => ({ ...prev, _activeOtp: otp }));
+                        } catch (e) {
+                          toast.error(e.message);
+                        }
+                      }}
+                    >
+                      Get Delivery OTP
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
+{!isCancelled && ['ACCEPTED', 'OUT_FOR_DELIVERY'].includes(order.status) && (
+
+              <TrackingScreen 
+                key={order.id} 
+                orderId={order.id} 
+                customerLocation={
+                  // Safely check for both camelCase and snake_case!
+                  (order.deliveryLat || order.delivery_lat) && (order.deliveryLng || order.delivery_lng)
+                    ? { 
+                        lat: Number(order.deliveryLat || order.delivery_lat), 
+                        lng: Number(order.deliveryLng || order.delivery_lng) 
+                      }
+                    : { lat: 25.4358, lng: 81.8463 } // Prayagraj Fallback
+                }
+              />
             )}
 
             {order.rider && !isCancelled && (

@@ -15,8 +15,11 @@ import { OrdersPage }            from './pages/OrdersPage';
 import { OrderDetailPage }       from './pages/OrderDetailPage';
 import { RiderDashboard }        from './pages/RiderDashboard';
 import { AdminDashboard }        from './pages/AdminDashboard';
+import { PharmacistDashboard }   from './pages/PharmacistDashboard';
 
-const SOCKET_URL = 'http://localhost:8080';
+const SOCKET_URL = import.meta.env.PROD 
+  ? window.location.origin 
+  : 'http://localhost:8080';
 const DEFAULT_CENTER = [20.5937, 78.9629];
 const DEFAULT_ZOOM = 6;
 const LIVE_ZOOM = 15;
@@ -37,16 +40,58 @@ function riderNeonIcon() {
     iconAnchor: [16, 16],
   });
 }
+// 1. ADD THIS ABOVE TrackingScreen: The Blue Customer Icon
+function customerHomeIcon() {
+  return L.divIcon({
+    className: 'tracking-marker-root leaflet-div-icon',
+    html: '<span class="tracking-marker-glow" style="background: rgba(59, 130, 246, 0.5);"></span><span class="tracking-marker-core" style="background: #3b82f6;"></span>',
+    iconSize: [32, 32],
+    iconAnchor: [16, 16],
+  });
+}
 
-/** Live map + Socket.IO: join room on mount, follow `location_update` events. */
-export function TrackingScreen({ orderId }) {
+// 2. ADD THIS ABOVE TrackingScreen: The Smart Auto-Zoom
+function MapBoundsSync({ riderLatLng, customerLatLng }) {
+  const map = useMap();
+  
+  useEffect(() => {
+    if (riderLatLng && customerLatLng) {
+      // Zoom out to fit both pins
+      const bounds = L.latLngBounds(
+        [riderLatLng.lat, riderLatLng.lng],
+        [customerLatLng.lat, customerLatLng.lng]
+      );
+      map.fitBounds(bounds, { padding: [70, 70], animate: true });
+    } else if (riderLatLng) {
+      map.setView([riderLatLng.lat, riderLatLng.lng], 15, { animate: true });
+    } else if (customerLatLng) {
+      map.setView([customerLatLng.lat, customerLatLng.lng], 15, { animate: true });
+    }
+  }, [riderLatLng, customerLatLng, map]);
+
+  return null;
+}
+
+const socket = io(SOCKET_URL, { 
+  transports: ['websocket', 'polling'],
+  autoConnect: false,
+  auth: {
+    token: localStorage.getItem('pd_token') || ''
+  }
+});
+
+export function TrackingScreen({ orderId, customerLocation }) {
   const [riderLatLng, setRiderLatLng] = useState(null);
-  const icon = useMemo(() => riderNeonIcon(), []);
+  
+  const riderIcon = useMemo(() => riderNeonIcon(), []);
+  const customerIcon = useMemo(() => customerHomeIcon(), []);
 
   useEffect(() => {
     if (!orderId) return;
-    const socket = io(SOCKET_URL, { transports: ['websocket', 'polling'] });
-    socket.emit('join_tracking_room', orderId);
+
+    // 2. Manually connect the socket when the map actually mounts
+    socket.connect();
+    socket.emit('join_tracking_room', String(orderId));
 
     const onLocationUpdate = (payload) => {
       const lat = payload?.lat ?? payload?.latitude;
@@ -60,14 +105,17 @@ export function TrackingScreen({ orderId }) {
     };
 
     socket.on('location_update', onLocationUpdate);
+    
     return () => {
       socket.off('location_update', onLocationUpdate);
-      socket.disconnect();
+      // DO NOT disconnect the global socket here!
+      // socket.disconnect(); 
     };
   }, [orderId]);
-
-  const center = riderLatLng ? [riderLatLng.lat, riderLatLng.lng] : DEFAULT_CENTER;
-  const zoom = riderLatLng ? LIVE_ZOOM : DEFAULT_ZOOM;
+  
+  // ... rest of your TrackingScreen code ...
+  const center = DEFAULT_CENTER;
+  const zoom = DEFAULT_ZOOM;
 
   return (
     <section className="tracking-screen od-section" aria-label="Live delivery tracking">
@@ -75,7 +123,7 @@ export function TrackingScreen({ orderId }) {
       <p className="tracking-screen-meta">
         {riderLatLng
           ? 'Rider location updates in real time.'
-          : 'Waiting for rider GPS… map centers when the first update arrives.'}
+          : 'Waiting for rider GPS... map centers when the first update arrives.'}
       </p>
       <div className="tracking-map-frame">
         <MapContainer
@@ -90,9 +138,17 @@ export function TrackingScreen({ orderId }) {
             attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
             url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
           />
-          <MapCenterSync center={center} zoom={zoom} />
+          
+          {/* Replaced MapCenterSync with MapBoundsSync */}
+          <MapBoundsSync riderLatLng={riderLatLng} customerLatLng={customerLocation} />
+          
           {riderLatLng && (
-            <Marker position={[riderLatLng.lat, riderLatLng.lng]} icon={icon} />
+            <Marker position={[riderLatLng.lat, riderLatLng.lng]} icon={riderIcon} />
+          )}
+
+          {/* New Customer Marker */}
+          {customerLocation && (
+            <Marker position={[customerLocation.lat, customerLocation.lng]} icon={customerIcon} />
           )}
         </MapContainer>
       </div>
@@ -109,6 +165,7 @@ function RoleHome() {
   if (!user)   return <LandingPage />;
   if (user.role === 'RIDER') return <Navigate to="/rider" replace />;
   if (user.role === 'ADMIN') return <Navigate to="/admin" replace />;
+  if (user.role === 'PHARMACIST' || user.role === 'PHARMACY_ADMIN') return <Navigate to="/pharmacist" replace />;
   return <Navigate to="/medicines" replace />;
 }
 
@@ -133,6 +190,9 @@ export default function App() {
 
             {/* Admin */}
             <Route path="/admin"       element={<ProtectedRoute roles={['ADMIN']}><AdminDashboard /></ProtectedRoute>} />
+
+            {/* Pharmacist */}
+            <Route path="/pharmacist"  element={<ProtectedRoute roles={['PHARMACIST', 'PHARMACY_ADMIN', 'ADMIN']}><PharmacistDashboard /></ProtectedRoute>} />
 
             <Route path="*"            element={<Navigate to="/" replace />} />
           </Routes>

@@ -16,12 +16,16 @@ export function ScanModal({ isOpen, onClose }) {
     setScanning(true);
     setResults(null);
     try {
-      // In a real app, we would pass the actual file
-      // const formData = new FormData();
-      // formData.append('prescription', file);
-      // const data = await api.scanPrescription(formData);
+      // Simulate network/AI delay
+      await new Promise(r => setTimeout(r, 2000));
       
-      const data = await api.scanPrescription({}); // Mocked
+      // Mocked results for the demo
+      const data = {
+        medicines: [
+          { id: 'mock-1', name: 'Paracetamol 500mg' },
+          { id: 'mock-2', name: 'Amoxicillin 250mg' }
+        ]
+      };
       setResults(data.medicines);
       toast.success('Prescription scanned successfully! 🔬');
     } catch (e) {

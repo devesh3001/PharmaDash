@@ -6,20 +6,25 @@ export async function listMedicines(_req: Request, res: Response): Promise<void>
     orderBy: { name: "asc" },
     include: {
       inventory: {
-        select: { stock_quantity: true },
+        select: { batches: { select: { quantity: true } } },
       },
     },
   });
 
   res.json({
-    medicines: medicines.map((m) => ({
-      id: m.id,
-      name: m.name,
-      generic_name: m.generic_name,
-      price: m.price.toString(),
-      requires_prescription: m.requires_prescription,
-      stock_quantity: m.inventory.reduce((sum, row) => sum + row.stock_quantity, 0),
-    })),
+    medicines: medicines.map((m) => {
+      const totalStock = m.inventory.reduce((sum, inv) => 
+        sum + inv.batches.reduce((bSum, b) => bSum + b.quantity, 0), 0);
+      
+      return {
+        id: m.id,
+        name: m.name,
+        generic_name: m.generic_name,
+        price: m.price.toString(),
+        requires_prescription: m.requires_prescription,
+        stock_quantity: totalStock,
+      };
+    }),
   });
 }
 

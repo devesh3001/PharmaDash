@@ -6,9 +6,11 @@ import {
   listOrders,
   getOrder,
   updateOrderStatus,
-  processPayment,
   submitOrderFeedback,
+  requestDeliveryOtp,
+  verifyDeliveryOtp,
 } from "../controllers/orders.controller";
+import { otpRequestLimiter, otpVerifyLimiter } from "../middleware/rateLimiter";
 
 export const ordersRouter = Router();
 
@@ -19,5 +21,6 @@ ordersRouter.post("/", requireRole("CUSTOMER"), asyncHandler(createOrder));
 ordersRouter.get("/", asyncHandler(listOrders));
 ordersRouter.get("/:id", asyncHandler(getOrder));
 ordersRouter.patch("/:id/status", requireRole("RIDER", "ADMIN"), asyncHandler(updateOrderStatus));
-ordersRouter.post("/:id/payment", requireRole("CUSTOMER"), asyncHandler(processPayment));
 ordersRouter.patch("/:id/feedback", requireRole("CUSTOMER"), asyncHandler(submitOrderFeedback));
+ordersRouter.post("/:id/delivery/request-otp", requireRole("CUSTOMER"), otpRequestLimiter, asyncHandler(requestDeliveryOtp));
+ordersRouter.post("/:id/delivery/verify-otp", requireRole("RIDER"), otpVerifyLimiter, asyncHandler(verifyDeliveryOtp));

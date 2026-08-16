@@ -9,7 +9,9 @@ import { MapContainer, TileLayer, Marker, Popup, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import io from 'socket.io-client';
 
-const SOCKET_URL = 'http://localhost:8080';
+const SOCKET_URL = import.meta.env.PROD 
+  ? window.location.origin
+  : 'http://localhost:8080';
 
 function useRiderLocation(orders) {
   const [isTracking, setIsTracking] = useState(false);
@@ -35,7 +37,12 @@ function useRiderLocation(orders) {
     }
 
     if (!socketRef.current) {
-      socketRef.current = io(SOCKET_URL, { transports: ['websocket', 'polling'] });
+      socketRef.current = io(SOCKET_URL, { 
+        transports: ['websocket', 'polling'],
+        auth: {
+          token: localStorage.getItem('pd_token') || ''
+        }
+      });
     }
     const socket = socketRef.current;
     setIsTracking(true);
@@ -80,23 +87,42 @@ function useRiderLocation(orders) {
 const NEXT_STATUS = {
   PENDING:          { label: 'Accept Order',   next: 'ACCEPTED',         cls: 'btn-action-cyan'   },
   ACCEPTED:         { label: 'Mark Picked Up', next: 'OUT_FOR_DELIVERY', cls: 'btn-action-purple' },
-  OUT_FOR_DELIVERY: { label: 'Mark Delivered', next: 'DELIVERED',        cls: 'btn-action-green'  },
+  OUT_FOR_DELIVERY: { label: 'Verify Delivery OTP', next: 'DELIVERED',        cls: 'btn-action-green'  },
 };
 
 const STATUS_EMOJI = { ACCEPTED: '✅ Accepted', OUT_FOR_DELIVERY: '🛵 Out for delivery', DELIVERED: '🎉 Delivered!' };
 
 function OrderRow({ order, onUpdate }) {
   const [busy, setBusy] = useState(false);
+  const [otpMode, setOtpMode] = useState(false);
+  const [otp, setOtp] = useState('');
   const toast  = useToast();
   const action = NEXT_STATUS[order.status];
   const total  = order.orderItems?.reduce((s, i) => s + parseFloat(i.unit_price) * i.quantity, 0) ?? 0;
 
   async function advance() {
     if (!action) return;
+    if (order.status === 'OUT_FOR_DELIVERY' && !otpMode) {
+      setOtpMode(true);
+      return;
+    }
+
     setBusy(true);
     try {
-      await api.updateOrderStatus(order.id, action.next);
-      toast.success(STATUS_EMOJI[action.next] ?? `Status updated to ${action.next}`);
+      if (order.status === 'OUT_FOR_DELIVERY') {
+        if (!otp || otp.length !== 6) {
+          toast.error("Please enter a valid 6-digit OTP");
+          setBusy(false);
+          return;
+        }
+        await api.verifyDeliveryOtp(order.id, otp);
+        toast.success(STATUS_EMOJI[action.next] ?? `Status updated to ${action.next}`);
+        setOtpMode(false);
+        setOtp('');
+      } else {
+        await api.updateOrderStatus(order.id, action.next);
+        toast.success(STATUS_EMOJI[action.next] ?? `Status updated to ${action.next}`);
+      }
       onUpdate();
     } catch (e) {
       toast.error(e.message);
@@ -121,11 +147,30 @@ function OrderRow({ order, onUpdate }) {
       <p className="roc-date">
         {new Date(order.createdAt).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}
       </p>
+      
+      {otpMode && (
+        <div style={{ marginTop: '12px', marginBottom: '12px', background: 'var(--surface)', padding: '12px', borderRadius: 'var(--r-sm)' }}>
+          <p style={{ color: 'var(--text)', fontSize: '14px', margin: '0 0 8px 0' }}>Ask the customer for their 6-digit Delivery OTP:</p>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <input 
+              type="text" 
+              className="input-field" 
+              placeholder="000000" 
+              value={otp} 
+              onChange={e => setOtp(e.target.value.replace(/\D/g, '').slice(0, 6))}
+              style={{ letterSpacing: '4px', fontSize: '18px', textAlign: 'center', flex: 1 }}
+              maxLength={6}
+            />
+            <button className="btn-outline-sm" onClick={() => setOtpMode(false)}>Cancel</button>
+          </div>
+        </div>
+      )}
+
       <div className="roc-actions">
         <Link to={`/orders/${order.id}`} className="btn-outline-sm">View Details</Link>
         {action && (
           <button className={`btn-action ${action.cls}`} onClick={advance} disabled={busy}>
-            {busy ? <span className="spinner-sm" /> : action.label}
+            {busy ? <span className="spinner-sm" /> : otpMode ? 'Submit OTP' : action.label}
           </button>
         )}
         {order.status === 'DELIVERED' && <span className="done-label">✅ Completed</span>}

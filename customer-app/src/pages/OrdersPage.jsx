@@ -54,7 +54,7 @@ export function OrdersPage() {
   ];
 
   const shown = orders.filter(o => {
-    if (filter === 'active') return ['PENDING','ACCEPTED','OUT_FOR_DELIVERY'].includes(o.status);
+    if (filter === 'active') return ['PAYMENT_PENDING','PENDING','ACCEPTED','OUT_FOR_DELIVERY'].includes(o.status);
     if (filter === 'done')   return o.status === 'DELIVERED';
     return true;
   });

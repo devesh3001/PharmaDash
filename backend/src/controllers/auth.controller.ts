@@ -27,12 +27,9 @@ export async function register(req: Request, res: Response): Promise<void> {
   if (!full_name || typeof full_name !== "string") {
     throw new AuthValidationError("full_name is required");
   }
-  if (!password || typeof password !== "string" || password.length < 4) {
-    throw new AuthValidationError("password must be at least 4 characters");
+  if (!password || typeof password !== "string" || password.length < 8) {
+    throw new AuthValidationError("password must be at least 8 characters");
   }
-
-  const allowedRoles = ["CUSTOMER", "RIDER", "ADMIN"];
-  const userRole = role && allowedRoles.includes(role) ? role : "CUSTOMER";
 
   const existing = await prisma.user.findUnique({ where: { phone_number } });
   if (existing) {
@@ -46,12 +43,12 @@ export async function register(req: Request, res: Response): Promise<void> {
       phone_number,
       full_name,
       password_hash,
-      role: userRole as "CUSTOMER" | "RIDER" | "ADMIN",
+      role: "CUSTOMER",
     },
     select: { id: true, phone_number: true, full_name: true, role: true, createdAt: true },
   });
 
-  const token = signToken({ sub: user.id, role: user.role });
+  const token = signToken({ sub: user.id, role: user.role, pharmacyId: (user as any).pharmacyId ?? undefined });
 
   res.status(201).json({ user, token });
 }
@@ -77,7 +74,7 @@ export async function login(req: Request, res: Response): Promise<void> {
     throw new AuthValidationError("Invalid credentials");
   }
 
-  const token = signToken({ sub: user.id, role: user.role });
+  const token = signToken({ sub: user.id, role: user.role, pharmacyId: user.pharmacyId ?? undefined });
 
   res.json({
     user: {
@@ -85,6 +82,7 @@ export async function login(req: Request, res: Response): Promise<void> {
       phone_number: user.phone_number,
       full_name: user.full_name,
       role: user.role,
+      pharmacyId: user.pharmacyId,
       createdAt: user.createdAt,
     },
     token,
