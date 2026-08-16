@@ -34,7 +34,8 @@ async function req(path, opts = {}) {
     if (res.status === 401 || res.status === 403) {
       window.dispatchEvent(new Event('unauthorized'));
     }
-    throw new Error(data.error ?? `HTTP ${res.status}`);
+    const errMsg = data.error && typeof data.error === 'object' ? data.error.message : data.error;
+    throw new Error(errMsg ?? `HTTP ${res.status}`);
   }
   return data;
 }
