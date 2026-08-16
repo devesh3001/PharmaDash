@@ -74,7 +74,6 @@ export function AuthPage() {
                 <select id="role" value={role} onChange={e => setRole(e.target.value)}>
                   <option value="CUSTOMER">Customer</option>
                   <option value="RIDER">Delivery Rider</option>
-                  <option value="ADMIN">Administrator</option>
                 </select>
               </div>
             </>
