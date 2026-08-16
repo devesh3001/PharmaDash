@@ -232,6 +232,12 @@ export function OrderDetailPage() {
             }
           }
         };
+
+        if (typeof window.Razorpay !== 'function') {
+          reject(new Error("Your browser's adblocker is preventing the payment gateway from loading. Please disable Brave Shields or your adblocker for this site."));
+          return;
+        }
+
         const rzp = new window.Razorpay(options);
         rzp.open();
       });
