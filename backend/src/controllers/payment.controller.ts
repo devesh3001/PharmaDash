@@ -70,9 +70,10 @@ export async function createPayment(req: Request, res: Response): Promise<void> 
     return;
   }
 
-  // ─── COD / Local Mode (kept for dev/test when PAYMENT_PROVIDER != razorpay)
-  if (!isRazorpayMode()) {
-    const method = (req.body as { method?: string }).method ?? "COD";
+  const method = (req.body as { method?: string }).method ?? (isRazorpayMode() ? "RAZORPAY" : "COD");
+
+  // ─── COD / Local Mode ───
+  if (method === "COD" || !isRazorpayMode()) {
     if (!["COD", "MOCK_UPI", "MOCK_CARD"].includes(method)) {
       res.status(400).json({ error: "Invalid payment method" });
       return;
@@ -105,7 +106,7 @@ export async function createPayment(req: Request, res: Response): Promise<void> 
     return;
   }
 
-  // ─── Razorpay Mode ────────────────────────────────────────────────────────
+  // ─── Razorpay Mode ───
   const razorpay = getRazorpayClient();
 
   // 5. If payment already exists with a providerOrderId, return it (idempotency)
