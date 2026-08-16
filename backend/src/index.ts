@@ -41,7 +41,7 @@ const app = express();
 
 // ─── Middleware ────────────────────────────────────────────────────────────────
 
-app.use(helmet());
+app.use(helmet({ contentSecurityPolicy: false }));
 app.use(
   cors({
     origin: process.env.NODE_ENV === "production" ? process.env.CLIENT_URL : ["http://localhost:5173", "http://localhost:3000"],
