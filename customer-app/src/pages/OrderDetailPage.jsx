@@ -188,12 +188,12 @@ export function OrderDetailPage() {
     });
   }
 
-  async function handlePayment() {
+  async function handlePayment(method = 'RAZORPAY') {
     setProcessingPayment(true);
     setConfirmingPayment(false);
     try {
       // 1. Call backend — backend calculates authoritative amount from DB
-      const checkoutData = await api.processPayment(order.id, {});
+      const checkoutData = await api.processPayment(order.id, { method });
 
       // 2. Local/COD mode: backend already transitioned the order
       if (!checkoutData.razorpayOrderId) {
@@ -391,18 +391,28 @@ export function OrderDetailPage() {
                 <p style={{ color: 'var(--text)', fontSize: '14px', marginBottom: '16px' }}>
                   Your prescription has been verified. Please complete your payment to confirm the order.
                 </p>
-                <button 
-                  className="btn-primary" 
-                  onClick={handlePayment}
-                  disabled={processingPayment || confirmingPayment}
-                  style={{ display: 'inline-flex', alignItems: 'center', gap: '8px' }}
-                >
-                  {confirmingPayment
-                    ? <><span className="spinner-sm" /> Confirming payment...</>
-                    : processingPayment
-                    ? <span className="spinner-sm" />
-                    : `💳 Pay ₹${total.toFixed(2)}`}
-                </button>
+                <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
+                  <button 
+                    className="btn-primary" 
+                    onClick={() => handlePayment('RAZORPAY')}
+                    disabled={processingPayment || confirmingPayment}
+                    style={{ display: 'inline-flex', alignItems: 'center', gap: '8px' }}
+                  >
+                    {confirmingPayment
+                      ? <><span className="spinner-sm" /> Confirming payment...</>
+                      : processingPayment
+                      ? <span className="spinner-sm" />
+                      : `💳 Pay ₹${total.toFixed(2)} Online`}
+                  </button>
+                  <button 
+                    className="btn-outline-sm" 
+                    onClick={() => handlePayment('COD')}
+                    disabled={processingPayment || confirmingPayment}
+                    style={{ display: 'inline-flex', alignItems: 'center', gap: '8px' }}
+                  >
+                    💵 Cash on Delivery
+                  </button>
+                </div>
               </div>
             )}
 
