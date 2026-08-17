@@ -330,7 +330,6 @@ export async function listOrders(req: Request, res: Response): Promise<void> {
       skip,
       take: limit,
       orderBy: [
-        { is_emergency: "desc" },
         { createdAt: "desc" }
       ],
       include: { orderItems: { select: ORDER_ITEM_SELECT } },
